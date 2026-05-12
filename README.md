@@ -32,6 +32,22 @@ python hwp2md.py input.hwpx -o docs/output.md --assets-dir docs/output.assets
 python hwp2md.py input.hwp --format obsidian --image-mode extract --table-mode gfm
 ```
 
+## 웹앱 실행
+
+브라우저에서 파일을 올려 변환하려면 로컬 웹앱을 실행합니다.
+
+```powershell
+python webapp.py
+```
+
+Windows에서는 배치 파일로도 실행할 수 있습니다.
+
+```powershell
+run_webapp.bat
+```
+
+기본 주소는 `http://127.0.0.1:8765`입니다. 변환 결과는 Markdown, assets, report를 묶은 zip 파일로 내려받습니다.
+
 변환이 완료되면 기본적으로 다음 파일이 생성됩니다.
 
 | 산출물 | 설명 |

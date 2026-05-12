@@ -12,6 +12,8 @@ env/
 
 # Local test scratch space
 .test_tmp/
+.webapp_tmp/
+webapp_tmp/
 
 # HWP/HWPX source documents and sample fixtures
 *.hwp
@@ -32,5 +34,6 @@ build/
 # Local/editor/system files
 .env
 .env.*
+.webapp*.log
 .DS_Store
 Thumbs.db
