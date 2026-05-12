@@ -1,0 +1,36 @@
+# Python runtime/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Local test scratch space
+.test_tmp/
+
+# HWP/HWPX source documents and sample fixtures
+*.hwp
+*.hwpx
+
+# Converter outputs
+sample_output/
+converted/
+*.assets/
+*.report.json
+*.ir.json
+
+# Packaged archives/build artifacts
+*.zip
+dist/
+build/
+
+# Local/editor/system files
+.env
+.env.*
+.DS_Store
+Thumbs.db
