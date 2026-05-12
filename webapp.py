@@ -105,7 +105,12 @@ def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, list
     return fields, files
 
 
+def upload_limit_mb() -> int:
+    return max(1, MAX_UPLOAD_BYTES // (1024 * 1024))
+
+
 def html_page(message: str | None = None, message_kind: str = "error") -> bytes:
+    max_upload_mb = upload_limit_mb()
     notice = ""
     if message:
         notice = f'<div class="notice {html.escape(message_kind)}">{html.escape(message)}</div>'
@@ -248,6 +253,15 @@ def html_page(message: str | None = None, message_kind: str = "error") -> bytes:
       color: var(--muted);
       font-size: 14px;
     }}
+    .files.error {{
+      color: var(--danger);
+      font-weight: 700;
+    }}
+    .upload-limit {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
     footer {{
       color: var(--muted);
       font-size: 13px;
@@ -282,8 +296,9 @@ def html_page(message: str | None = None, message_kind: str = "error") -> bytes:
       <form id="convertForm" action="/convert" method="post" enctype="multipart/form-data">
         <div>
           <label for="documents">문서 선택</label>
-          <input id="documents" name="documents" type="file" accept=".hwp,.hwpx" multiple required>
-          <div id="fileList" class="files"></div>
+          <input id="documents" name="documents" type="file" accept=".hwp,.hwpx" multiple required data-max-upload-bytes="{MAX_UPLOAD_BYTES}">
+          <div class="upload-limit">전체 업로드 크기는 {max_upload_mb}MB 이하로 제한됩니다.</div>
+          <div id="fileList" class="files" role="status" aria-live="polite"></div>
         </div>
         <div class="options">
           <div>
@@ -323,13 +338,35 @@ def html_page(message: str | None = None, message_kind: str = "error") -> bytes:
     const input = document.getElementById("documents");
     const fileList = document.getElementById("fileList");
     const button = document.getElementById("submitButton");
+    const maxUploadBytes = Number(input.dataset.maxUploadBytes || "0");
+    const maxUploadMB = Math.max(1, Math.floor(maxUploadBytes / 1024 / 1024));
 
-    input.addEventListener("change", () => {{
-      const names = Array.from(input.files || []).map((file) => file.name);
-      fileList.textContent = names.length ? names.join(", ") : "";
-    }});
+    function updateFileList() {{
+      const files = Array.from(input.files || []);
+      const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+      const tooLarge = maxUploadBytes > 0 && totalBytes > maxUploadBytes;
+      const names = files.map((file) => file.name);
 
-    form.addEventListener("submit", () => {{
+      if (tooLarge) {{
+        fileList.textContent = `선택한 파일 합계가 ${{maxUploadMB}}MB를 넘습니다. 파일 수를 줄이거나 더 작은 파일을 올려 주세요.`;
+      }} else {{
+        fileList.textContent = names.length ? names.join(", ") : "";
+      }}
+      fileList.classList.toggle("error", tooLarge);
+      button.disabled = tooLarge;
+      if (tooLarge || button.textContent !== "변환 중") {{
+        button.textContent = "변환 시작";
+      }}
+      return !tooLarge;
+    }}
+
+    input.addEventListener("change", updateFileList);
+
+    form.addEventListener("submit", (event) => {{
+      if (!updateFileList()) {{
+        event.preventDefault();
+        return;
+      }}
       button.disabled = true;
       button.textContent = "변환 중";
     }});
