@@ -6,8 +6,10 @@ import dataclasses
 import html
 import io
 import json
+import os
 import re
 import shutil
+import tempfile
 import time
 import uuid
 import zipfile
@@ -22,10 +24,22 @@ from urllib.parse import urlparse
 import hwp2md
 
 
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+LOCAL_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+VERCEL_MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(
+    os.environ.get(
+        "HWP2MD_MAX_UPLOAD_BYTES",
+        VERCEL_MAX_UPLOAD_BYTES if os.environ.get("VERCEL") else LOCAL_MAX_UPLOAD_BYTES,
+    )
+)
 SUPPORTED_SUFFIXES = {".hwp", ".hwpx"}
 APP_ROOT = Path(__file__).resolve().parent
-APP_TMP_ROOT = APP_ROOT / "webapp_tmp"
+APP_TMP_ROOT = Path(
+    os.environ.get(
+        "HWP2MD_TMP_ROOT",
+        Path(tempfile.gettempdir()) / "hwp2md" if os.environ.get("VERCEL") else APP_ROOT / "webapp_tmp",
+    )
+)
 
 
 @dataclasses.dataclass
@@ -367,7 +381,8 @@ class Hwp2MdRequestHandler(BaseHTTPRequestHandler):
         if content_length <= 0:
             raise ValueError("업로드된 파일이 없습니다.")
         if content_length > MAX_UPLOAD_BYTES:
-            raise ValueError("파일이 너무 큽니다. 한 번에 100MB 이하로 올려 주세요.")
+            max_upload_mb = max(1, MAX_UPLOAD_BYTES // (1024 * 1024))
+            raise ValueError(f"File is too large. Upload up to {max_upload_mb}MB at a time.")
 
         body = self.rfile.read(content_length)
         fields, uploaded_files = parse_multipart_form(self.headers.get("Content-Type", ""), body)
