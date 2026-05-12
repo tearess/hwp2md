@@ -19,7 +19,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import hwp2md
 
@@ -66,6 +66,27 @@ def unique_child_path(parent: Path, filename: str) -> Path:
         if not next_candidate.exists():
             return next_candidate
     raise hwp2md.ConversionError(f"파일 이름이 너무 많이 겹칩니다: {filename}")
+
+
+def zip_download_filename(source_names: list[str]) -> str:
+    if not source_names:
+        return "hwp2md-result.zip"
+    first_stem = Path(source_names[0]).stem or "document"
+    if len(source_names) == 1:
+        return f"{first_stem}.zip"
+    return f"{first_stem}-외{len(source_names) - 1}개.zip"
+
+
+def ascii_download_fallback(filename: str) -> str:
+    safe = "".join(char if 32 <= ord(char) < 127 and char not in {'"', "\\", ";"} else "_" for char in filename)
+    safe = safe.strip(" .") or "hwp2md-result.zip"
+    return safe if safe.lower().endswith(".zip") else f"{safe}.zip"
+
+
+def attachment_content_disposition(filename: str) -> str:
+    fallback = ascii_download_fallback(filename)
+    encoded = quote(filename, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def field_value(fields: dict[str, list[str]], name: str, default: str) -> str:
@@ -340,6 +361,40 @@ def html_page(message: str | None = None, message_kind: str = "error") -> bytes:
     const button = document.getElementById("submitButton");
     const maxUploadBytes = Number(input.dataset.maxUploadBytes || "0");
     const maxUploadMB = Math.max(1, Math.floor(maxUploadBytes / 1024 / 1024));
+    const buttonReadyText = "\ubcc0\ud658 \uc2dc\uc791";
+    const buttonBusyText = "\ubcc0\ud658 \uc911";
+    const buttonDoneText = "\ubcc0\ud658 \uc644\ub8cc";
+    let isSubmitting = false;
+
+    function downloadFilename(response) {{
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const utf8Match = disposition.match(/filename\\*=UTF-8''([^;]+)/i);
+      if (utf8Match) {{
+        return decodeURIComponent(utf8Match[1]);
+      }}
+      const match = disposition.match(/filename="?([^";]+)"?/i);
+      return match ? match[1] : "hwp2md-result.zip";
+    }}
+
+    async function errorMessageFrom(response) {{
+      const text = await response.text();
+      const document = new DOMParser().parseFromString(text, "text/html");
+      const notice = document.querySelector(".notice");
+      return notice && notice.textContent.trim()
+        ? notice.textContent.trim()
+        : "\ubcc0\ud658\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4.";
+    }}
+
+    function saveBlob(blob, filename) {{
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }}
 
     function updateFileList() {{
       const files = Array.from(input.files || []);
@@ -362,13 +417,36 @@ def html_page(message: str | None = None, message_kind: str = "error") -> bytes:
 
     input.addEventListener("change", updateFileList);
 
-    form.addEventListener("submit", (event) => {{
+    form.addEventListener("submit", async (event) => {{
       if (!updateFileList()) {{
         event.preventDefault();
         return;
       }}
+      event.preventDefault();
+      isSubmitting = true;
       button.disabled = true;
-      button.textContent = "변환 중";
+      button.textContent = buttonBusyText;
+
+      try {{
+        const response = await fetch(form.action, {{
+          method: "POST",
+          body: new FormData(form),
+        }});
+        if (!response.ok) {{
+          throw new Error(await errorMessageFrom(response));
+        }}
+        saveBlob(await response.blob(), downloadFilename(response));
+        fileList.textContent = "\ubcc0\ud658 \uc644\ub8cc. \ub2e4\uc6b4\ub85c\ub4dc\uac00 \uc2dc\uc791\ub410\uc2b5\ub2c8\ub2e4.";
+        fileList.classList.remove("error");
+        button.textContent = buttonDoneText;
+      }} catch (error) {{
+        fileList.textContent = error instanceof Error ? error.message : "\ubcc0\ud658\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4.";
+        fileList.classList.add("error");
+        button.textContent = buttonReadyText;
+      }} finally {{
+        isSubmitting = false;
+        button.disabled = false;
+      }}
     }});
   </script>
 </body>
@@ -425,6 +503,7 @@ class Hwp2MdRequestHandler(BaseHTTPRequestHandler):
         fields, uploaded_files = parse_multipart_form(self.headers.get("Content-Type", ""), body)
         options = build_options(fields)
         file_items = [item for item in uploaded_files if item.field_name == "documents" and item.filename]
+        source_names = [sanitize_upload_filename(item.filename or "document.hwp") for item in file_items]
         if not file_items:
             raise ValueError("변환할 HWP/HWPX 파일을 선택해 주세요.")
 
@@ -438,8 +517,7 @@ class Hwp2MdRequestHandler(BaseHTTPRequestHandler):
             output_root.mkdir()
             summary: list[dict[str, Any]] = []
 
-            for item in file_items:
-                original_name = sanitize_upload_filename(item.filename or "document.hwp")
+            for item, original_name in zip(file_items, source_names):
                 if Path(original_name).suffix.lower() not in SUPPORTED_SUFFIXES:
                     raise ValueError(f"지원하지 않는 파일입니다: {original_name}")
                 input_path = unique_child_path(input_dir, original_name)
@@ -464,10 +542,10 @@ class Hwp2MdRequestHandler(BaseHTTPRequestHandler):
                 )
 
             zip_data = write_zip(output_root, summary)
-            filename = "hwp2md-result.zip"
+            filename = zip_download_filename(source_names)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", attachment_content_disposition(filename))
             self.send_header("Content-Length", str(len(zip_data)))
             self.end_headers()
             self.wfile.write(zip_data)
