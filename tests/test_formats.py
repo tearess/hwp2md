@@ -168,6 +168,44 @@ class HwpxTableTests(unittest.TestCase):
         self.assertEqual([b.type for b in blocks], ["table"])
 
 
+class CorruptFileTests(unittest.TestCase):
+    def test_corrupt_ole_header_becomes_conversion_error(self) -> None:
+        # OLE 시그니처는 맞지만 섹터 크기 값이 터무니없는 파일: olefile 내부 ValueError가 그대로 새어 나오면 안 된다.
+        header = bytearray(512)
+        header[0:8] = hwp2md.HWP_CFB_SIGNATURE
+        header[26:28] = struct.pack("<H", 3)
+        header[28:30] = struct.pack("<H", 0xFFFE)
+        header[30:32] = struct.pack("<H", 0xFFFF)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "corrupt.hwp"
+            path.write_bytes(bytes(header))
+            with self.assertRaises(hwp2md.ConversionError):
+                hwp2md.convert_file(path, Path(tmp) / "out.md", None, None, hwp2md.ConvertOptions())
+
+    def test_truncated_zip_becomes_conversion_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "broken.hwpx"
+            path.write_bytes(b"PK" + bytes(30))
+            with self.assertRaises(hwp2md.ConversionError):
+                hwp2md.convert_file(path, Path(tmp) / "out.md", None, None, hwp2md.ConvertOptions())
+
+
+class ContentBlockPerformanceTests(unittest.TestCase):
+    def test_has_content_blocks_does_not_copy_the_whole_list(self) -> None:
+        import time
+
+        blocks = [hwp2md.Block(type="paragraph", text="가") for _ in range(30000)]
+        start = time.perf_counter()
+        for _ in range(30000):
+            self.assertTrue(hwp2md.has_content_blocks(blocks))
+        # 이전에는 호출마다 전체 목록을 복사해서 문단 수의 제곱만큼 걸렸다.
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+    def test_metadata_only_blocks_are_not_content(self) -> None:
+        self.assertFalse(hwp2md.has_content_blocks([hwp2md.Block(type="metadata", text="{}"), hwp2md.Block(type="page_artifact", text="x")]))
+        self.assertTrue(hwp2md.has_content_blocks([hwp2md.Block(type="metadata", text="{}"), hwp2md.Block(type="paragraph", text="가")]))
+
+
 class BmpConversionTests(unittest.TestCase):
     def png_pixels(self, png: bytes) -> list[bytes]:
         import zlib
@@ -308,6 +346,21 @@ class ListMarkerTests(unittest.TestCase):
 
     def test_paired_parenthesis_number_is_still_a_list(self) -> None:
         self.assertEqual(self.kind("(2) 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신합니다."), ("ordered_list", "위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신합니다."))
+
+
+class EmptyTableCaptionTests(unittest.TestCase):
+    def test_caption_text_survives_when_all_cells_are_empty(self) -> None:
+        # 칸이 전부 빈 표는 버리지만, 캡션에 글이 있으면 그 글은 남아야 한다.
+        ctrl = hwp2md.HWP_TABLE_CTRL_ID + bytes(8)
+        records = [
+            (hwp2md.HWP_CTRL_HEADER_TAG, 1, ctrl),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, bytes(16)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("표 위 캡션 문장")),
+            (hwp2md.HWP_TABLE_TAG, 2, rec_table(1, 1)),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(0, 0)),
+        ]
+        blocks, _ = hwp2md.parse_hwp_table_records(records, 0, "none", True, False)
+        self.assertEqual([b.text for b in blocks], ["표 위 캡션 문장"])
 
 
 class DigitOnlyTableCellTests(unittest.TestCase):

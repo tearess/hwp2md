@@ -27,6 +27,8 @@ from xml.etree import ElementTree as ET
 VERSION = "0.1.0"
 ASSET_MANIFEST_NAME = ".hwp2md-assets.json"
 PAGE_ARTIFACT_MAX_ROWS = 8
+NON_CONTENT_BLOCK_TYPES = frozenset({"metadata", "page_artifact"})
+CORRUPT_FILE_ERRORS = (zipfile.BadZipFile, zlib.error, struct.error, ValueError, KeyError, EOFError, IndexError, ET.ParseError, RecursionError)
 HWP_TEXT_LEAD_BYTES = b"\xef\xbb\xbf \t\r\n"
 HWP_CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 HWP_SIGNATURE = b"HWP Document File"
@@ -422,16 +424,19 @@ def finalize_table_blocks(
     """복원한 표(HWP/HWPX 공용)를 보도자료 머리표/결재란/표/문단 중 알맞은 블록으로 바꾼다."""
     grid = build_hwp_table_grid(rows, cols, cells)
     table_text = " ".join(cell.text for cell in cells if cell.text).strip()
-    if is_press_release_header_table(table_text) and not include_page_artifacts:
-        metadata = parse_press_release_metadata(cells)
-        return [Block(type="metadata", text=json.dumps(metadata, ensure_ascii=False))] if metadata else []
-    if is_page_artifact_table(rows, cols, cells, grid) and not include_page_artifacts:
-        dropped = " ".join(table_text.split())
-        return [Block(type="page_artifact", text=dropped)] if dropped else []
     caption_blocks: list[Block] = []
     for caption in caption_lines:
         for part in split_text_to_candidate_blocks(caption):
             append_text_block(caption_blocks, part, heading_policy, is_first=not document_has_blocks and not caption_blocks, include_page_artifacts=include_page_artifacts)
+    if is_press_release_header_table(table_text) and not include_page_artifacts:
+        metadata = parse_press_release_metadata(cells)
+        return [Block(type="metadata", text=json.dumps(metadata, ensure_ascii=False))] if metadata else []
+    if not table_text:
+        # 칸이 전부 비어 있는 표는 버리되, 표 위/아래 캡션에 글이 있으면 그 글은 남긴다.
+        return caption_blocks
+    if is_page_artifact_table(rows, cols, cells, grid) and not include_page_artifacts:
+        dropped = " ".join(table_text.split())
+        return caption_blocks + [Block(type="page_artifact", text=dropped)]
     if should_render_hwp_table(rows, cols, cells, grid):
         return caption_blocks + [Block(type="table", rows=grid, cells=cells)]
 
@@ -831,10 +836,10 @@ def bmp_to_png(data: bytes) -> Optional[bytes]:
 
 
 def append_image_anchor_if_caption(blocks: list[Block]) -> bool:
-    visible = content_blocks(blocks)
-    if not visible:
+    # 마지막 본문 블록만 필요하므로 뒤에서부터 찾는다(전체 목록을 복사하면 도형이 많은 문서에서 제곱 시간이 걸린다).
+    last = next((block for block in reversed(blocks) if block.type not in NON_CONTENT_BLOCK_TYPES), None)
+    if last is None:
         return False
-    last = visible[-1]
     if last.type == "image_anchor":
         return False
     if last.text and is_figure_caption_text(last.text):
@@ -1069,7 +1074,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                         records,
                         idx,
                         options.heading_policy,
-                        document_has_blocks=bool(content_blocks(blocks)),
+                        document_has_blocks=has_content_blocks(blocks),
                         include_page_artifacts=options.include_page_artifacts,
                     )
                         if parsed_table:
@@ -1107,7 +1112,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                                 continue
                             seen_header_footer.add(hf_text)
                             for part in split_text_to_candidate_blocks(hf_text):
-                                append_text_block(blocks, part, options.heading_policy, is_first=not content_blocks(blocks), include_page_artifacts=options.include_page_artifacts)
+                                append_text_block(blocks, part, options.heading_policy, is_first=not has_content_blocks(blocks), include_page_artifacts=options.include_page_artifacts)
                         record_count += max(0, next_idx - idx - 1)
                         idx = next_idx
                         continue
@@ -1115,7 +1120,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                     para_count += 1
                     text = clean_hwp_text_payload(payload)
                     for part in split_text_to_candidate_blocks(text):
-                        append_text_block(blocks, part, options.heading_policy, is_first=not content_blocks(blocks), include_page_artifacts=options.include_page_artifacts)
+                        append_text_block(blocks, part, options.heading_policy, is_first=not has_content_blocks(blocks), include_page_artifacts=options.include_page_artifacts)
                 idx += 1
 
         if options.image_mode != "skip":
@@ -1128,6 +1133,8 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
             if ole.exists("PrvText"):
                 try:
                     preview = ole.openstream("PrvText").read().decode("utf-16le", errors="ignore")
+                    # PrvText는 표 칸을 "<칸 내용>"으로 감싼다. 빈 칸 "<>"가 제목/문단으로 나오지 않게 지운다.
+                    preview = re.sub(r"<\s*>", "", preview)
                     for part in split_text_to_candidate_blocks(clean_plain_text(preview)):
                         append_text_block(blocks, part, options.heading_policy, include_page_artifacts=options.include_page_artifacts)
                     warnings.append(WarningItem("PREVIEW_TEXT_USED", "BodyText 추출 결과가 비어 있어 PrvText를 fallback으로 사용했습니다."))
@@ -1498,7 +1505,7 @@ def hwpx_table_blocks(table: ET.Element, blocks: list[Block], heading_policy: st
     if not parsed:
         return []
     rows, cols, cells, caption_lines = parsed
-    return finalize_table_blocks(rows, cols, cells, caption_lines, heading_policy, bool(content_blocks(blocks)), include_page_artifacts)
+    return finalize_table_blocks(rows, cols, cells, caption_lines, heading_policy, has_content_blocks(blocks), include_page_artifacts)
 
 
 def walk_hwpx_blocks(elem: ET.Element, blocks: list[Block], heading_policy: str, include_page_artifacts: bool = False) -> None:
@@ -1540,7 +1547,12 @@ def collect_metadata(blocks: list[Block]) -> dict[str, Any]:
 
 
 def content_blocks(blocks: list[Block]) -> list[Block]:
-    return [block for block in blocks if block.type not in {"metadata", "page_artifact"}]
+    return [block for block in blocks if block.type not in NON_CONTENT_BLOCK_TYPES]
+
+
+def has_content_blocks(blocks: list[Block]) -> bool:
+    """본문 블록이 하나라도 있는지 확인한다. 목록 전체를 복사하지 않고 첫 본문 블록에서 바로 끝낸다."""
+    return any(block.type not in NON_CONTENT_BLOCK_TYPES for block in blocks)
 
 
 def build_report(input_path: Path, fmt: str, blocks: list[Block], assets: list[Asset], warnings: list[WarningItem], losses: list[LossItem]) -> dict[str, Any]:
@@ -1887,12 +1899,19 @@ def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path]
     ensure_parent(output_path)
     ensure_parent(report_path)
     fmt = detect_format(input_path)
-    if fmt == "hwp":
-        result = convert_hwp(input_path, output_path, assets_dir, options)
-    elif fmt == "hwpx":
-        result = convert_hwpx(input_path, output_path, assets_dir, options)
-    else:
-        raise ConversionError(f"지원하지 않는 파일 형식입니다: {fmt}")
+    try:
+        if fmt == "hwp":
+            result = convert_hwp(input_path, output_path, assets_dir, options)
+        elif fmt == "hwpx":
+            result = convert_hwpx(input_path, output_path, assets_dir, options)
+        else:
+            raise ConversionError(f"지원하지 않는 파일 형식입니다: {fmt}")
+    except ConversionError:
+        raise
+    except CORRUPT_FILE_ERRORS as exc:
+        # 손상된 파일에서 olefile/zipfile/zlib 내부 오류가 그대로 보이지 않게 변환 오류로 바꾼다.
+        # 코드 자체의 버그(TypeError 등)는 가리지 않도록 데이터 손상에서 나오는 예외만 잡는다.
+        raise ConversionError(f"손상된 파일이거나 읽을 수 없는 구조입니다 ({type(exc).__name__}: {str(exc)[:120]})") from exc
 
     result.report["elapsedSeconds"] = round(time.time() - start, 3)
     output_path.write_text(result.markdown, encoding="utf-8")
