@@ -26,6 +26,8 @@ from xml.etree import ElementTree as ET
 
 VERSION = "0.1.0"
 ASSET_MANIFEST_NAME = ".hwp2md-assets.json"
+PAGE_ARTIFACT_MAX_ROWS = 8
+HWP_TEXT_LEAD_BYTES = b"\xef\xbb\xbf \t\r\n"
 HWP_CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 HWP_SIGNATURE = b"HWP Document File"
 HWP_PARA_TEXT_TAG = 67
@@ -85,6 +87,7 @@ class Block:
     cells: list[TableCell] | None = None
     path: str | None = None
     alt: str | None = None
+    number: int | None = None
 
 
 @dataclasses.dataclass
@@ -113,14 +116,29 @@ class ConversionError(Exception):
     """사용자에게 보여줄 수 있는 변환 오류."""
 
 
+def unsupported_format_reason(head: bytes) -> Optional[str]:
+    """OLE/ZIP이 아닌 파일의 헤더를 보고 변환할 수 없는 이유를 알려준다."""
+    if head.startswith(b"HWP Document File"):
+        return "HWP 3.0(한글 97 이전) 형식이라 지원하지 않습니다. 한글에서 열어 .hwp(5.x) 또는 .hwpx로 다시 저장한 뒤 변환하세요."
+    if b"DRMONE" in head[:16]:
+        return "DRM으로 암호화된 문서라 변환할 수 없습니다. DRM을 해제한 파일로 다시 시도하세요."
+    stripped = head.lstrip(HWP_TEXT_LEAD_BYTES)
+    if stripped.startswith(b"<"):
+        return "XML/HTML 텍스트 문서이며 HWP 파일이 아닙니다. 확장자만 .hwp로 저장된 파일일 수 있습니다."
+    return None
+
+
 def detect_format(path: Path) -> str:
     with path.open("rb") as f:
-        head = f.read(16)
+        head = f.read(32)
     suffix = path.suffix.lower()
     if head.startswith(HWP_CFB_SIGNATURE):
         return "hwp"
     if zipfile.is_zipfile(path):
         return "hwpx"
+    reason = unsupported_format_reason(head)
+    if reason:
+        raise ConversionError(reason)
     if suffix == ".hwp":
         return "hwp"
     if suffix == ".hwpx":
@@ -198,6 +216,8 @@ def clean_hwp_decoded_text(s: str, skip_extended_controls: bool) -> str:
             # 확장 제어문자는 대체로 control char + 4 UTF-16 units + control char 형태로 나타난다.
             if not skip_extended_controls:
                 i += 1
+            elif i + 7 < len(s) and s[i + 7] == ch:
+                i += 8
             elif i + 5 < len(s) and s[i + 5] == ch:
                 i += 6
             elif i + 4 < len(s):
@@ -350,7 +370,8 @@ def parse_hwp_table_records(
         blocks = [Block(type="metadata", text=json.dumps(metadata, ensure_ascii=False))] if metadata else []
         return blocks, idx
     if is_page_artifact_table(rows, cols, cells, grid) and not include_page_artifacts:
-        return [], idx
+        dropped = " ".join(table_text.split())
+        return ([Block(type="page_artifact", text=dropped)] if dropped else []), idx
     if should_render_hwp_table(rows, cols, cells, grid):
         return [Block(type="table", rows=grid, cells=cells)], idx
 
@@ -409,7 +430,8 @@ def is_page_artifact_table(rows: int, cols: int, cells: list[TableCell], grid: l
         return True
     if is_press_release_header_table(text):
         return True
-    if cols < 12:
+    # 결재란/시행란은 행 수가 적다. 행이 많은 큰 표는 신청서 같은 서식 본문이므로 버리지 않는다.
+    if cols < 12 or rows > PAGE_ARTIFACT_MAX_ROWS:
         return False
     footer_keywords = ["시행", "접수", "협조자", "전화", "전송", "비공개", "서울시", "www.", "우 "]
     keyword_hits = sum(1 for keyword in footer_keywords if keyword in text)
@@ -879,6 +901,18 @@ def add_asset_position_warnings(assets: list[Asset], blocks: list[Block], assets
         losses.append(LossItem("ASSET_INLINE_POSITION_APPROXIMATED", approximated))
 
 
+def add_page_artifact_warnings(blocks: list[Block], warnings: list[WarningItem], losses: list[LossItem]) -> None:
+    dropped = [block.text or "" for block in blocks if block.type == "page_artifact"]
+    if not dropped:
+        return
+    preview = " / ".join(text[:60] for text in dropped[:3])
+    warnings.append(WarningItem(
+        "PAGE_ARTIFACT_TABLE_DROPPED",
+        f"결재란/머리말/꼬리말로 판단한 표 {len(dropped)}개를 출력에서 제외했습니다. 포함하려면 --include-page-artifacts를 사용하세요. 예: {preview}",
+    ))
+    losses.append(LossItem("PAGE_ARTIFACT_TABLE_DROPPED", len(dropped)))
+
+
 def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: ConvertOptions) -> ConvertResult:
     olefile = import_olefile()
     if not olefile.isOleFile(str(input_path)):
@@ -973,6 +1007,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
 
         losses.append(LossItem("LAYOUT_DROPPED", 1))
         losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
+        add_page_artifact_warnings(blocks, warnings, losses)
         add_asset_position_warnings(assets, blocks, assets_dir, warnings, losses)
         add_hwp_control_warnings(
             control_counts,
@@ -1067,12 +1102,17 @@ def append_text_block(
         level, heading_text = explicit_heading
         blocks.append(Block(type="heading", text=heading_text, level=level))
         return
-    list_match = re.match(r"^(?P<marker>(?:[-*+])|(?:[•·∙◦ㆍ□○〇■▶▷◇◆※ㅇ])|(?:\(?\d{1,3}\)?[.)])|(?:[가-하]\.)|(?:[A-Za-z][.)]))\s*(?P<body>.+)$", text)
+    list_match = re.match(r"^(?P<marker>(?:[-*+])|(?:[•·∙◦ㆍ□○〇■▶▷◇◆※ㅇ])|(?:\(?\d{1,3}\)?[.)](?!\d))|(?:[가-하]\.)|(?:[A-Za-z][.)]))\s*(?P<body>.+)$", text)
     if list_match:
         marker = list_match.group("marker")
         body = list_match.group("body").strip()
-        kind = "ordered_list" if re.match(r"^\(?\d+\)?[.)]$", marker) else "bullet_list"
-        blocks.append(Block(type=kind, text=body))
+        if re.match(r"^\(?\d+\)?[.)]$", marker):
+            blocks.append(Block(type="ordered_list", text=body, number=int(re.sub(r"\D", "", marker))))
+            return
+        # 가./나./A. 같은 항목 기호는 본문 구조를 나타내므로 글머리표로 바꾸되 기호는 보존한다.
+        if re.match(r"^(?:[가-하]\.|[A-Za-z][.)])$", marker):
+            body = f"{marker} {body}"
+        blocks.append(Block(type="bullet_list", text=body))
         return
     level = infer_heading_level(text, heading_policy, is_first=(not blocks if is_first is None else is_first))
     if level:
@@ -1283,7 +1323,7 @@ def collect_metadata(blocks: list[Block]) -> dict[str, Any]:
 
 
 def content_blocks(blocks: list[Block]) -> list[Block]:
-    return [block for block in blocks if block.type != "metadata"]
+    return [block for block in blocks if block.type not in {"metadata", "page_artifact"}]
 
 
 def build_report(input_path: Path, fmt: str, blocks: list[Block], assets: list[Asset], warnings: list[WarningItem], losses: list[LossItem]) -> dict[str, Any]:
@@ -1334,6 +1374,8 @@ def render_markdown(input_path: Path, blocks: list[Block], assets: list[Asset], 
         elif block.type == "ordered_list":
             if last_list_type != block.type:
                 ordered_index = 1
+            if block.number is not None:
+                ordered_index = block.number
             lines.append(f"{ordered_index}. {escape_md_text(block.text or '')}")
             ordered_index += 1
             last_list_type = block.type

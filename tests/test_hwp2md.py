@@ -132,6 +132,40 @@ class Hwp2MdUnitTests(unittest.TestCase):
 
         self.assertEqual(table[0], "| 열1 | 열2 |")
 
+    def test_extended_control_is_skipped_as_eight_units(self) -> None:
+        # 확장 제어문자는 제어코드 + 데이터 6유닛 + 제어코드(총 8유닛)이며, 뒤따르는 "1." 번호를 먹으면 안 된다.
+        raw = "\x03汫╣\x00\x00\x00\x00\x031. 귀 대표회의의 무궁한 발전을 기원합니다."
+        self.assertEqual(hwp2md.clean_hwp_decoded_text(raw, skip_extended_controls=True), "1. 귀 대표회의의 무궁한 발전을 기원합니다.")
+
+    def test_ordered_list_keeps_original_numbers(self) -> None:
+        blocks: list[hwp2md.Block] = []
+        for text in ["2. 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신하여 드립니다.", "3. 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신하여 드립니다."]:
+            hwp2md.append_text_block(blocks, text, "font", is_first=False)
+        self.assertEqual([b.number for b in blocks], [2, 3])
+        options = hwp2md.ConvertOptions(frontmatter="none")
+        report = hwp2md.build_report(Path("a.hwp"), "hwp", blocks, [], [], [])
+        markdown = hwp2md.render_markdown(Path("a.hwp"), blocks, [], report, options, Path("a.md"), Path("a.assets"))
+        self.assertIn("2. 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신하여 드립니다.\n3. 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신하여 드립니다.", markdown)
+
+    def test_korean_letter_markers_are_preserved(self) -> None:
+        blocks: list[hwp2md.Block] = []
+        hwp2md.append_text_block(blocks, "가. 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신하여 드립니다.", "font", is_first=False)
+        self.assertEqual((blocks[0].type, blocks[0].text), ("bullet_list", "가. 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신하여 드립니다."))
+
+    def test_decimal_number_is_not_a_list_marker(self) -> None:
+        blocks: list[hwp2md.Block] = []
+        hwp2md.append_text_block(blocks, "0.0%미만", "none", is_first=False)
+        self.assertEqual((blocks[0].type, blocks[0].text), ("paragraph", "0.0%미만"))
+
+    def test_dropped_page_artifact_table_is_reported(self) -> None:
+        blocks = [hwp2md.Block(type="page_artifact", text="협조자 시행 서울시 강남구")]
+        warnings: list[hwp2md.WarningItem] = []
+        losses: list[hwp2md.LossItem] = []
+        hwp2md.add_page_artifact_warnings(blocks, warnings, losses)
+        self.assertEqual(warnings[0].code, "PAGE_ARTIFACT_TABLE_DROPPED")
+        self.assertIn("협조자", warnings[0].message)
+        self.assertEqual(hwp2md.content_blocks(blocks), [])
+
     def test_clean_generated_assets_removes_only_current_stem_outputs(self) -> None:
         assets_dir = ROOT / "sample_output" / "_unit_assets"
         assets_dir.mkdir(exist_ok=True)
