@@ -1,6 +1,7 @@
 import struct
 import tempfile
 import unittest
+from xml.etree import ElementTree as ET
 from pathlib import Path
 
 import hwp2md
@@ -67,6 +68,175 @@ class TableCellEscapeTests(unittest.TestCase):
     def test_pipe_is_escaped_once_and_angle_brackets_are_entities(self) -> None:
         cell = hwp2md.escape_table_cell("가|나 <신 설> 다_라" + chr(10) + "마")
         self.assertEqual(cell, "가" + chr(92) + "|나 &lt;신 설&gt; 다" + chr(92) + "_라<br>마")
+
+
+class FootnoteAndHeaderTests(unittest.TestCase):
+    def test_control_id_sets_use_little_endian_ids(self) -> None:
+        self.assertIn(b"  nf", hwp2md.HWP_FOOTNOTE_CTRL_IDS)
+        self.assertNotIn(b"toof", hwp2md.HWP_FOOTNOTE_CTRL_IDS)
+        self.assertIn(b"toof", hwp2md.HWP_HEADER_FOOTER_CTRL_IDS)
+
+    def test_footnote_text_is_extracted_from_nested_paragraphs(self) -> None:
+        records = [
+            (hwp2md.HWP_CTRL_HEADER_TAG, 1, b"  nf" + bytes(8)),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, bytes(16)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("각주 첫 문단")),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("각주 둘째 문단")),
+            (hwp2md.HWP_PARA_TEXT_TAG, 1, rec_text("다시 본문")),
+        ]
+        text, next_idx = hwp2md.extract_hwp_footnote(records, 0)
+        self.assertEqual(text, "각주 첫 문단 각주 둘째 문단")
+        self.assertEqual(next_idx, 4)
+
+    def test_skip_nested_records_stops_at_same_level(self) -> None:
+        records = [
+            (hwp2md.HWP_CTRL_HEADER_TAG, 1, b"toof" + bytes(8)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("쪽 꼬리말")),
+            (hwp2md.HWP_PARA_TEXT_TAG, 1, rec_text("본문")),
+        ]
+        self.assertEqual(hwp2md.skip_nested_records(records, 0), 2)
+
+
+HP_NS = 'xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"'
+
+
+def hwpx_blocks(xml: str) -> list[hwp2md.Block]:
+    root = ET.fromstring(xml)
+    blocks: list[hwp2md.Block] = []
+    hwp2md.walk_hwpx_blocks(root, blocks, "none")
+    return blocks
+
+
+class HwpxTableTests(unittest.TestCase):
+    def tc(self, col: int, row: int, text: str, colspan: int = 1, rowspan: int = 1) -> str:
+        paragraphs = "".join(f"<hp:p><hp:run><hp:t>{line}</hp:t></hp:run></hp:p>" for line in text.split("|")) if text else "<hp:p><hp:run/></hp:p>"
+        return (
+            f"<hp:tc><hp:subList>{paragraphs}</hp:subList>"
+            f'<hp:cellAddr colAddr="{col}" rowAddr="{row}"/><hp:cellSpan colSpan="{colspan}" rowSpan="{rowspan}"/></hp:tc>'
+        )
+
+    def test_table_inside_paragraph_is_restored_with_spans_and_cell_lines(self) -> None:
+        xml = (
+            f"<hp:sec {HP_NS}><hp:p><hp:run><hp:t>표 앞 문장입니다</hp:t></hp:run><hp:run><hp:tbl>"
+            f"<hp:tr>{self.tc(0, 0, '구분')}{self.tc(1, 0, '내용', colspan=2)}</hp:tr>"
+            f"<hp:tr>{self.tc(0, 1, '가')}{self.tc(1, 1, '첫째|둘째')}{self.tc(2, 1, '다')}</hp:tr>"
+            f"</hp:tbl></hp:run></hp:p></hp:sec>"
+        )
+        blocks = hwpx_blocks(xml)
+        self.assertEqual(blocks[0].text, "표 앞 문장입니다")
+        table = blocks[-1]
+        self.assertEqual(table.type, "table")
+        self.assertEqual(len(table.cells), 5)
+        self.assertEqual(table.cells[1].colspan, 2)
+        self.assertEqual(table.rows[1][1], "첫째<br>둘째")
+
+    def test_paragraph_text_is_not_glued_with_table_text(self) -> None:
+        xml = (
+            f"<hp:sec {HP_NS}><hp:p><hp:run><hp:tbl>"
+            f"<hp:tr>{self.tc(0, 0, '구분')}{self.tc(1, 0, '회사명')}</hp:tr>"
+            f"<hp:tr>{self.tc(0, 1, '대표자')}{self.tc(1, 1, '주소')}</hp:tr>"
+            f"</hp:tbl></hp:run></hp:p></hp:sec>"
+        )
+        blocks = hwpx_blocks(xml)
+        self.assertTrue(all(b.type != "heading" for b in blocks))
+        self.assertEqual([b.type for b in blocks], ["table"])
+
+
+class BmpConversionTests(unittest.TestCase):
+    def png_pixels(self, png: bytes) -> list[bytes]:
+        import zlib
+
+        pos = 8
+        idat = b""
+        width = 0
+        while pos < len(png):
+            length = struct.unpack(">I", png[pos : pos + 4])[0]
+            kind = png[pos + 4 : pos + 8]
+            body = png[pos + 8 : pos + 8 + length]
+            if kind == b"IHDR":
+                width = struct.unpack(">I", body[:4])[0]
+            if kind == b"IDAT":
+                idat += body
+            pos += 12 + length
+        raw = zlib.decompress(idat)
+        stride = 1 + width * 3
+        return [raw[i + 1 : i + stride] for i in range(0, len(raw), stride)]
+
+    def make_bmp(self, bpp: int, rows_bottom_up: list[list[tuple[int, int, int]]]) -> bytes:
+        width = len(rows_bottom_up[0])
+        height = len(rows_bottom_up)
+        pix = bpp // 8
+        stride = ((width * bpp + 31) // 32) * 4
+        pixels = b""
+        for row in rows_bottom_up:
+            data = b"".join(bytes([b, g, r]) + (b"\xff" if pix == 4 else b"") for r, g, b in row)
+            pixels += data + bytes(stride - len(data))
+        header = b"BM" + struct.pack("<IHHI", 54 + len(pixels), 0, 0, 54)
+        dib = struct.pack("<IiiHHIIiiII", 40, width, height, 1, bpp, 0, len(pixels), 0, 0, 0, 0)
+        return header + dib + pixels
+
+    def test_24_and_32_bit_bmp_are_converted_to_the_same_rgb_pixels(self) -> None:
+        # 아래에서 위로 저장되는 BMP: 첫 행이 이미지 맨 아래 줄이다.
+        bottom_up = [[(1, 2, 3), (4, 5, 6), (7, 8, 9)], [(10, 11, 12), (13, 14, 15), (16, 17, 18)]]
+        expected = [bytes([10, 11, 12, 13, 14, 15, 16, 17, 18]), bytes([1, 2, 3, 4, 5, 6, 7, 8, 9])]
+        for bpp in (24, 32):
+            png = hwp2md.bmp_to_png(self.make_bmp(bpp, bottom_up))
+            self.assertIsNotNone(png)
+            self.assertEqual(self.png_pixels(png), expected, f"{bpp}bpp")
+
+
+class MarkdownSafetyTests(unittest.TestCase):
+    def test_leading_hash_and_quote_are_escaped(self) -> None:
+        self.assertEqual(hwp2md.escape_md_text("#7. 질문입니다"), chr(92) + "#7. 질문입니다")
+        self.assertEqual(hwp2md.escape_md_text("> 인용처럼 보이는 문장"), chr(92) + "> 인용처럼 보이는 문장")
+        self.assertEqual(hwp2md.escape_md_text("중간의 # 기호는 그대로"), "중간의 # 기호는 그대로")
+
+    def test_long_clause_sentence_is_not_a_heading(self) -> None:
+        long_clause = "제11항 한자음 ‘랴, 려, 례, 료, 류, 리’가 단어의 첫머리에 올 적에는, 두음 법칙에 따라 ‘야, 여, 예, 요, 유, 이’로 적는다."
+        self.assertIsNone(hwp2md.infer_heading_level(long_clause, "font"))
+        self.assertEqual(hwp2md.infer_heading_level("제3장 총칙", "font"), 2)
+
+    def test_empty_rows_are_dropped_from_gfm_tables(self) -> None:
+        out = hwp2md.render_table([["항목", "값"], ["", ""], ["가", "1"]], "gfm")
+        self.assertEqual(len(out), 3)
+        self.assertNotIn("|  |  |", "\n".join(out))
+
+    def test_empty_file_gets_a_clear_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.hwp"
+            path.write_bytes(b"")
+            with self.assertRaises(hwp2md.ConversionError) as ctx:
+                hwp2md.detect_format(path)
+            self.assertIn("빈 파일", str(ctx.exception))
+
+
+class EmptyTableRowTests(unittest.TestCase):
+    def test_fully_empty_rows_are_not_rendered_in_html_tables(self) -> None:
+        cells = [
+            hwp2md.TableCell(row=0, col=0, text="가", colspan=1),
+            hwp2md.TableCell(row=0, col=1, text="나"),
+            hwp2md.TableCell(row=1, col=0, text=""),
+            hwp2md.TableCell(row=1, col=1, text=""),
+            hwp2md.TableCell(row=2, col=0, text="다"),
+            hwp2md.TableCell(row=2, col=1, text="라"),
+        ]
+        rows = [["가", "나"], ["", ""], ["다", "라"]]
+        html_out = "\n".join(hwp2md.render_html_table(rows, cells))
+        self.assertEqual(html_out.count("<tr>"), 2)
+        self.assertNotIn("<td></td><td></td>", html_out)
+
+
+class SymbolFontTests(unittest.TestCase):
+    def test_wingdings_private_use_glyphs_become_standard_symbols(self) -> None:
+        raw = "설치" + chr(0xF09E) + "운영 " + chr(0xF53A) + "글 " + chr(0xF0FC)
+        self.assertEqual(hwp2md.clean_hwp_decoded_text(raw, skip_extended_controls=True), "설치·운영 한글 ✓")
+
+    def test_leading_symbol_font_bullet_becomes_list_item(self) -> None:
+        blocks: list[hwp2md.Block] = []
+        raw = chr(0xF06D) + " 산업체 수요에 의한 맞춤형 교육과정을 운영하기 위한 계약학과 설치 근거를 마련한다."
+        text = hwp2md.clean_hwp_decoded_text(raw, skip_extended_controls=True)
+        hwp2md.append_text_block(blocks, text, "none", is_first=False)
+        self.assertEqual((blocks[0].type, blocks[0].text), ("bullet_list", "산업체 수요에 의한 맞춤형 교육과정을 운영하기 위한 계약학과 설치 근거를 마련한다."))
 
 
 class SingleUnitControlTests(unittest.TestCase):

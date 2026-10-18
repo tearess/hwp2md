@@ -38,11 +38,24 @@ HWP_TABLE_CTRL_ID = b" lbt"
 HWP_SHAPE_CTRL_ID = b" osg"
 HWP_EQUATION_RECORD_TAG = 88
 HWP_EQUATION_CTRL_IDS = {b"deqe", b"eqed"}
-HWP_FOOTNOTE_CTRL_IDS = {b"toof", b"foot", b" nf", b"fn  "}
-HWP_LAYOUT_CTRL_IDS = {b"dces", b"dloc", b"pngp", b"dhgp", b"onwn", b"spct", b"tcgp", b"daeh"}
+# 컨트롤 ID는 리틀 엔디언으로 저장되어 "fn  "은 b"  nf", "en  "(미주)은 b"  ne"로 나타난다.
+HWP_FOOTNOTE_CTRL_IDS = {b"  nf", b"  ne"}
+# 머리말("head")/꼬리말("foot")도 같은 이유로 b"daeh"/b"toof"이다.
+HWP_HEADER_FOOTER_CTRL_IDS = {b"daeh", b"toof"}
+HWP_LAYOUT_CTRL_IDS = {b"dces", b"dloc", b"pngp", b"dhgp", b"onwn", b"spct", b"tcgp", b"daeh", b"toof"}
 HWP_FIELD_CTRL_IDS = {b"umf%", b"klc%"}
 HWP_PRIVATE_SQUARE_BULLET = "\U000f03da"
 HWP_PRIVATE_NUMBER_BASE = 0xF02B0
+# Wingdings/Symbol 글꼴 기호는 U+F000 + 글꼴 코드 위치의 사용자 정의 영역 글자로 저장된다.
+# 그대로 두면 뷰어에서 네모로 보이므로 대응하는 표준 유니코드 기호로 바꾼다.
+HWP_SYMBOL_FONT_MAP = {
+    0xF06C: "●", 0xF06D: "❍", 0xF06E: "■", 0xF06F: "□", 0xF071: "❑",
+    0xF075: "◆", 0xF076: "❖", 0xF077: "◆", 0xF09E: "·", 0xF09F: "•",
+    0xF0A7: "▪", 0xF0D8: "➢", 0xF0E8: "➔", 0xF0F0: "⇨", 0xF0FC: "✓",
+    0xF081: "①", 0xF082: "②", 0xF083: "③", 0xF084: "④", 0xF085: "⑤",
+    0xF086: "⑥", 0xF087: "⑦", 0xF088: "⑧", 0xF089: "⑨", 0xF08A: "⑩",
+    0xF53A: "한",  # 한글 로고 글자
+}
 
 
 @dataclasses.dataclass
@@ -131,6 +144,8 @@ def unsupported_format_reason(head: bytes) -> Optional[str]:
 def detect_format(path: Path) -> str:
     with path.open("rb") as f:
         head = f.read(32)
+    if not head:
+        raise ConversionError("빈 파일(0바이트)입니다. 내용이 없는 파일은 변환할 수 없습니다.")
     suffix = path.suffix.lower()
     if head.startswith(HWP_CFB_SIGNATURE):
         return "hwp"
@@ -164,6 +179,8 @@ def escape_md_text(text: str) -> str:
     # 문장 내부의 과도한 이스케이프는 가독성을 해치므로 Markdown 구조 문자 일부만 보수적으로 처리한다.
     text = text.replace("\\", "\\\\")
     text = re.sub(r"([*_`])", r"\\\1", text)
+    # 줄 맨 앞의 '#', '>'는 제목/인용으로 해석되므로 이스케이프한다.
+    text = re.sub(r"^(\s*)([#>])", r"\1\\\2", text)
     return text
 
 
@@ -240,7 +257,7 @@ def clean_hwp_decoded_text(s: str, skip_extended_controls: bool) -> str:
             continue
         out.append(ch)
         i += 1
-    text = "".join(out)
+    text = "".join(out).translate(HWP_SYMBOL_FONT_MAP)
     # HWP 내부 객체 anchor가 남긴 짧은 영문 토큰 제거.
     text = re.sub(r"\b(?:dces|lcol|hdpg|pnpg|onwn|tcpg| lbt|dahe)\b", "", text)
     return clean_plain_text(text)
@@ -381,21 +398,34 @@ def parse_hwp_table_records(
     if not saw_table_record or rows is None or cols is None or not cells:
         return None
 
+    blocks = finalize_table_blocks(rows, cols, cells, caption_lines, heading_policy, document_has_blocks, include_page_artifacts)
+    return blocks, idx
+
+
+def finalize_table_blocks(
+    rows: int,
+    cols: int,
+    cells: list[TableCell],
+    caption_lines: list[str],
+    heading_policy: str,
+    document_has_blocks: bool,
+    include_page_artifacts: bool,
+) -> list[Block]:
+    """복원한 표(HWP/HWPX 공용)를 보도자료 머리표/결재란/표/문단 중 알맞은 블록으로 바꾼다."""
     grid = build_hwp_table_grid(rows, cols, cells)
     table_text = " ".join(cell.text for cell in cells if cell.text).strip()
     if is_press_release_header_table(table_text) and not include_page_artifacts:
         metadata = parse_press_release_metadata(cells)
-        blocks = [Block(type="metadata", text=json.dumps(metadata, ensure_ascii=False))] if metadata else []
-        return blocks, idx
+        return [Block(type="metadata", text=json.dumps(metadata, ensure_ascii=False))] if metadata else []
     if is_page_artifact_table(rows, cols, cells, grid) and not include_page_artifacts:
         dropped = " ".join(table_text.split())
-        return ([Block(type="page_artifact", text=dropped)] if dropped else []), idx
+        return [Block(type="page_artifact", text=dropped)] if dropped else []
     caption_blocks: list[Block] = []
     for caption in caption_lines:
         for part in split_text_to_candidate_blocks(caption):
             append_text_block(caption_blocks, part, heading_policy, is_first=not document_has_blocks and not caption_blocks, include_page_artifacts=include_page_artifacts)
     if should_render_hwp_table(rows, cols, cells, grid):
-        return caption_blocks + [Block(type="table", rows=grid, cells=cells)], idx
+        return caption_blocks + [Block(type="table", rows=grid, cells=cells)]
 
     flattened: list[Block] = list(caption_blocks)
     for cell in sorted(cells, key=lambda item: (item.row, item.col)):
@@ -403,7 +433,7 @@ def parse_hwp_table_records(
             is_first = not document_has_blocks and not flattened
             # 표 칸의 숫자는 쪽 번호가 아니라 데이터이므로 쪽 번호 필터를 적용하지 않는다.
             append_text_block(flattened, part, heading_policy, is_first=is_first, include_page_artifacts=True)
-    return flattened, idx
+    return flattened
 
 
 def build_hwp_table_grid(rows: int, cols: int, cells: list[TableCell]) -> list[list[str]]:
@@ -424,7 +454,7 @@ def format_table_cell_lines(text: str) -> list[str]:
         if private_bullet:
             line = f"- {private_bullet}"
         else:
-            match = re.match(r"^(?:(?:[•·∙◦ㆍ□○〇■▶▷◇◆※ㅇ])\s*|(?:[-*+])\s+)(?P<body>.+)$", line)
+            match = re.match(r"^(?:(?:[•·∙◦ㆍ□○〇■▶▷◇◆※ㅇ●❍❑❖▪➔⇨➢✓])\s*|(?:[-*+])\s+)(?P<body>.+)$", line)
             if match:
                 line = f"- {match.group('body').strip()}"
         lines.append(line)
@@ -603,6 +633,7 @@ def add_hwp_control_warnings(
     losses: list[LossItem],
     equation_fallback_count: int = 0,
     footnote_fallback_count: int = 0,
+    footnote_restored_count: int = 0,
 ) -> None:
     non_table = {key: value for key, value in control_counts.items() if key != HWP_TABLE_CTRL_ID}
     if not non_table:
@@ -610,7 +641,7 @@ def add_hwp_control_warnings(
     equation_count = sum(count for key, count in non_table.items() if key in HWP_EQUATION_CTRL_IDS)
     footnote_count = sum(count for key, count in non_table.items() if key in HWP_FOOTNOTE_CTRL_IDS)
     equation_dropped = max(0, equation_count - equation_fallback_count)
-    footnote_dropped = max(0, footnote_count - footnote_fallback_count)
+    footnote_dropped = max(0, footnote_count - footnote_fallback_count - footnote_restored_count)
     if equation_fallback_count:
         warnings.append(WarningItem("EQUATION_FALLBACK_USED", f"HWP 수식 control {equation_fallback_count}개를 Markdown 수식 fallback으로 보존했습니다."))
     if equation_dropped:
@@ -769,22 +800,26 @@ def bmp_to_png(data: bytes) -> Optional[bytes]:
     if pixel_offset + row_stride * abs_height > len(data):
         return None
 
+    # 행 단위 슬라이싱으로 BGR(A) -> RGB 변환한다(픽셀 단위 파이썬 루프는 대형 BMP에서 매우 느리다).
+    bytes_per_pixel = bpp // 8
     raw = bytearray()
     for out_row in range(abs_height):
         src_row = abs_height - 1 - out_row if height > 0 else out_row
         row_start = pixel_offset + src_row * row_stride
+        row = data[row_start : row_start + width * bytes_per_pixel]
+        rgb = bytearray(width * 3)
+        rgb[0::3] = row[2::bytes_per_pixel]
+        rgb[1::3] = row[1::bytes_per_pixel]
+        rgb[2::3] = row[0::bytes_per_pixel]
         raw.append(0)  # PNG filter type: None
-        for col in range(width):
-            px = row_start + col * (bpp // 8)
-            b, g, r = data[px], data[px + 1], data[px + 2]
-            raw.extend((r, g, b))
+        raw.extend(rgb)
 
     def chunk(kind: bytes, payload: bytes) -> bytes:
         crc = zlib.crc32(kind + payload) & 0xFFFFFFFF
         return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc)
 
     ihdr = struct.pack(">IIBBBBB", width, abs_height, 8, 2, 0, 0, 0)
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b"")
 
 
 def append_image_anchor_if_caption(blocks: list[Block]) -> bool:
@@ -837,6 +872,33 @@ def hwp_equation_to_latex(text: str) -> str:
     return text
 
 
+def extract_hwp_footnote(records: list[tuple[int, int, bytes]], start_idx: int) -> tuple[str, int]:
+    """각주/미주 컨트롤 아래에 중첩된 문단 텍스트를 모아 (텍스트, 다음 레코드 인덱스)를 돌려준다."""
+    _tag, ctrl_level, _payload = records[start_idx]
+    parts: list[str] = []
+    idx = start_idx + 1
+    while idx < len(records) and records[idx][1] > ctrl_level:
+        if records[idx][0] == HWP_PARA_TEXT_TAG:
+            text = clean_hwp_text_payload(records[idx][2])
+            if text:
+                parts.append(text)
+        idx += 1
+    return " ".join(parts).strip(), idx
+
+
+def skip_nested_records(records: list[tuple[int, int, bytes]], start_idx: int) -> int:
+    """컨트롤 레코드 아래에 중첩된 모든 레코드를 건너뛴 다음 인덱스를 돌려준다."""
+    ctrl_level = records[start_idx][1]
+    idx = start_idx + 1
+    while idx < len(records) and records[idx][1] > ctrl_level:
+        idx += 1
+    return idx
+
+
+def is_footnote_placeholder(block: Block) -> bool:
+    return block.type == "footnote" and (block.text or "").startswith("HWP 각주 내용은")
+
+
 def append_footnote_placeholder(blocks: list[Block], index: int) -> None:
     blocks.append(Block(type="footnote", text=f"HWP 각주 내용은 원본 문서의 footnote control #{index}에 있습니다."))
 
@@ -857,7 +919,7 @@ def count_equation_fallbacks(blocks: list[Block]) -> int:
 
 
 def count_footnote_fallbacks(blocks: list[Block]) -> int:
-    total = count_blocks(blocks, "footnote")
+    total = sum(1 for block in blocks if is_footnote_placeholder(block))
     for block in content_blocks(blocks):
         if block.type == "table":
             if block.cells:
@@ -970,6 +1032,8 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
         para_count = 0
         record_count = 0
         control_counts: dict[bytes, int] = {}
+        seen_header_footer: set[str] = set()
+        repeated_header_footer = 0
         for section in sections:
             try:
                 data = read_hwp_stream(ole, section, compressed)
@@ -1007,7 +1071,33 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                         equation = extract_hwp_equation(records, idx)
                         blocks.append(Block(type="equation", text=equation or r"\text{HWP equation}"))
                     elif control_id in HWP_FOOTNOTE_CTRL_IDS:
-                        append_footnote_placeholder(blocks, count_blocks(blocks, "footnote") + 1)
+                        footnote_text, next_idx = extract_hwp_footnote(records, idx)
+                        if footnote_text:
+                            blocks.append(Block(type="footnote", text=footnote_text))
+                        else:
+                            append_footnote_placeholder(blocks, count_blocks(blocks, "footnote") + 1)
+                        record_count += max(0, next_idx - idx - 1)
+                        idx = next_idx
+                        continue
+                    elif control_id in HWP_HEADER_FOOTER_CTRL_IDS:
+                        # 머리말/꼬리말은 구역마다 같은 내용이 반복되므로 처음 한 번만 본문에 남기고 반복은 제외한다.
+                        # 내용이 본문 정보일 수도 있어 통째로 버리지는 않는다.
+                        next_idx = skip_nested_records(records, idx)
+                        for hf_tag, _hf_level, hf_payload in records[idx + 1 : next_idx]:
+                            if hf_tag != HWP_PARA_TEXT_TAG:
+                                continue
+                            hf_text = clean_hwp_text_payload(hf_payload)
+                            if not hf_text:
+                                continue
+                            if hf_text in seen_header_footer:
+                                repeated_header_footer += 1
+                                continue
+                            seen_header_footer.add(hf_text)
+                            for part in split_text_to_candidate_blocks(hf_text):
+                                append_text_block(blocks, part, options.heading_policy, is_first=not content_blocks(blocks), include_page_artifacts=options.include_page_artifacts)
+                        record_count += max(0, next_idx - idx - 1)
+                        idx = next_idx
+                        continue
                 if tag_id == HWP_PARA_TEXT_TAG:
                     para_count += 1
                     text = clean_hwp_text_payload(payload)
@@ -1034,13 +1124,20 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
         losses.append(LossItem("LAYOUT_DROPPED", 1))
         losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
         add_page_artifact_warnings(blocks, warnings, losses)
+        if repeated_header_footer:
+            warnings.append(WarningItem(
+                "HEADER_FOOTER_REPEATS_COLLAPSED",
+                f"구역마다 반복되는 머리말/꼬리말 {repeated_header_footer}개는 처음 한 번만 남기고 제외했습니다.",
+            ))
         add_asset_position_warnings(assets, blocks, assets_dir, warnings, losses)
+        footnote_fallback = count_footnote_fallbacks(blocks)
         add_hwp_control_warnings(
             control_counts,
             warnings,
             losses,
             equation_fallback_count=count_equation_fallbacks(blocks),
-            footnote_fallback_count=count_footnote_fallbacks(blocks),
+            footnote_fallback_count=footnote_fallback,
+            footnote_restored_count=max(0, count_blocks(blocks, "footnote") - sum(1 for b in blocks if is_footnote_placeholder(b))),
         )
 
         report = build_report(input_path, "hwp", blocks, assets, warnings, losses)
@@ -1128,7 +1225,7 @@ def append_text_block(
         level, heading_text = explicit_heading
         blocks.append(Block(type="heading", text=heading_text, level=level))
         return
-    list_match = re.match(r"^(?P<marker>(?:[-*+])|(?:[•·∙◦ㆍ□○〇■▶▷◇◆※ㅇ])|(?:(?:\(\d{1,3}\)|\d{1,3}[.)])(?!\d))|(?:[가-하]\.)|(?:[A-Za-z][.)]))\s*(?P<body>.+)$", text)
+    list_match = re.match(r"^(?P<marker>(?:[-*+])|(?:[•·∙◦ㆍ□○〇■▶▷◇◆※ㅇ●❍❑❖▪➔⇨➢✓])|(?:(?:\(\d{1,3}\)|\d{1,3}[.)])(?!\d))|(?:[가-하]\.)|(?:[A-Za-z][.)]))\s*(?P<body>.+)$", text)
     if list_match:
         marker = list_match.group("marker")
         body = list_match.group("body").strip()
@@ -1189,9 +1286,9 @@ def infer_heading_level(text: str, policy: str, is_first: bool = False) -> Optio
         return None
     if is_first and len(stripped) <= 80:
         return 1
-    if re.match(r"^(제\s*\d+\s*[장절관항]|제\s*[一二三四五六七八九十]+\s*[장절관항])\b", stripped):
+    if re.match(r"^(제\s*\d+\s*[장절관항]|제\s*[一二三四五六七八九十]+\s*[장절관항])\b", stripped) and len(stripped) <= 60:
         return 2
-    if re.match(r"^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[.)]\s+", stripped):
+    if re.match(r"^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[.)]\s+", stripped) and len(stripped) <= 60:
         return 2
     if re.match(r"^\d+\.\s+\S", stripped) and len(stripped) <= 80:
         return 2
@@ -1278,11 +1375,11 @@ def local_name(elem: ET.Element) -> str:
     return elem.tag.rsplit("}", 1)[-1] if "}" in elem.tag else elem.tag
 
 
-def collect_text(elem: ET.Element) -> str:
-    return clean_plain_text(collect_text_with_inline_styles(elem))
+def collect_text(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
+    return clean_plain_text(collect_text_with_inline_styles(elem, skip))
 
 
-def collect_text_with_inline_styles(elem: ET.Element) -> str:
+def collect_text_with_inline_styles(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
     name = local_name(elem)
     if name in {"lineBreak", "br"}:
         return "\n"
@@ -1292,7 +1389,8 @@ def collect_text_with_inline_styles(elem: ET.Element) -> str:
     if elem.text:
         parts.append(elem.text)
     for child in list(elem):
-        parts.append(collect_text_with_inline_styles(child))
+        if not (skip and id(child) in skip):
+            parts.append(collect_text_with_inline_styles(child, skip))
         if child.tail:
             parts.append(child.tail)
     text = "".join(parts)
@@ -1310,21 +1408,99 @@ def collect_text_with_inline_styles(elem: ET.Element) -> str:
     return text
 
 
+HWPX_TABLE_NAMES = {"tbl", "table"}
+
+
+def hwpx_top_level_tables(elem: ET.Element) -> list[ET.Element]:
+    """elem 아래에서 다른 표 안에 들어 있지 않은 최상위 표만 찾는다."""
+    found: list[ET.Element] = []
+    for child in list(elem):
+        if local_name(child) in HWPX_TABLE_NAMES:
+            found.append(child)
+        else:
+            found.extend(hwpx_top_level_tables(child))
+    return found
+
+
+def hwpx_paragraph_lines(container: ET.Element) -> list[str]:
+    """셀/캡션 안의 문단을 줄 단위로 모은다. 중첩된 표는 행 단위 줄로 풀어 쓴다."""
+    lines: list[str] = []
+    for child in list(container):
+        name = local_name(child)
+        if name == "p":
+            nested = hwpx_top_level_tables(child)
+            text = collect_text(child, {id(t) for t in nested})
+            if text:
+                lines.extend(part for part in text.split(chr(10)) if part.strip())
+            for table in nested:
+                for tr in [x for x in table.iter() if local_name(x) in {"tr", "row"}]:
+                    row_texts = []
+                    for tc in [x for x in list(tr) if local_name(x) in {"tc", "cell"}]:
+                        row_texts.append(" ".join(hwpx_paragraph_lines(tc)))
+                    if any(row_texts):
+                        lines.append(" ".join(t for t in row_texts if t))
+        elif name in HWPX_TABLE_NAMES:
+            continue
+        else:
+            lines.extend(hwpx_paragraph_lines(child))
+    return lines
+
+
+def parse_hwpx_table(table: ET.Element) -> Optional[tuple[int, int, list[TableCell], list[str]]]:
+    cells: list[TableCell] = []
+    caption_lines: list[str] = []
+    for child in list(table):
+        if local_name(child) == "caption":
+            caption_lines.extend(hwpx_paragraph_lines(child))
+    for row_pos, tr in enumerate([x for x in list(table) if local_name(x) in {"tr", "row"}]):
+        col_pos = 0
+        for tc in [x for x in list(tr) if local_name(x) in {"tc", "cell"}]:
+            addr = next((x for x in list(tc) if local_name(x) == "cellAddr"), None)
+            span = next((x for x in list(tc) if local_name(x) == "cellSpan"), None)
+
+            def number(node: Optional[ET.Element], key: str, default: int) -> int:
+                try:
+                    return max(0, int(node.get(key))) if node is not None and node.get(key) is not None else default
+                except ValueError:
+                    return default
+
+            row = number(addr, "rowAddr", row_pos)
+            col = number(addr, "colAddr", col_pos)
+            rowspan = max(1, number(span, "rowSpan", 1))
+            colspan = max(1, number(span, "colSpan", 1))
+            text = "\n".join(hwpx_paragraph_lines(tc))
+            cells.append(TableCell(row=row, col=col, text=text, rowspan=rowspan, colspan=colspan))
+            col_pos = col + colspan
+    if not cells:
+        return None
+    rows = max(cell.row + cell.rowspan for cell in cells)
+    cols = max(cell.col + cell.colspan for cell in cells)
+    return rows, cols, cells, caption_lines
+
+
+def hwpx_table_blocks(table: ET.Element, blocks: list[Block], heading_policy: str, include_page_artifacts: bool) -> list[Block]:
+    parsed = parse_hwpx_table(table)
+    if not parsed:
+        return []
+    rows, cols, cells, caption_lines = parsed
+    return finalize_table_blocks(rows, cols, cells, caption_lines, heading_policy, bool(content_blocks(blocks)), include_page_artifacts)
+
+
 def walk_hwpx_blocks(elem: ET.Element, blocks: list[Block], heading_policy: str, include_page_artifacts: bool = False) -> None:
     name = local_name(elem)
-    if name in {"tbl", "table"}:
-        rows: list[list[str]] = []
-        for tr in [x for x in elem.iter() if local_name(x) in {"tr", "row"}]:
-            cells = []
-            for tc in [x for x in list(tr) if local_name(x) in {"tc", "cell"}]:
-                cells.append(collect_text(tc).replace("\n", " ").strip())
-            if cells:
-                rows.append(cells)
-        if rows:
-            blocks.append(Block(type="table", rows=rows))
+    if name in HWPX_TABLE_NAMES:
+        blocks.extend(hwpx_table_blocks(elem, blocks, heading_policy, include_page_artifacts))
         return
     if name == "p":
-        # 표 내부 문단 중복은 상위 tbl 처리에서 걸러진다. 단독 문단만 처리한다.
+        # HWPX는 표가 문단(p > run > tbl) 안에 들어 있다. 표를 뺀 문단 텍스트를 먼저 내고 표는 따로 복원한다.
+        nested_tables = hwpx_top_level_tables(elem)
+        if nested_tables:
+            text = collect_text(elem, {id(t) for t in nested_tables})
+            for part in split_text_to_candidate_blocks(text):
+                append_text_block(blocks, part, heading_policy, include_page_artifacts=include_page_artifacts)
+            for table in nested_tables:
+                blocks.extend(hwpx_table_blocks(table, blocks, heading_policy, include_page_artifacts))
+            return
         text = collect_text(elem)
         if text:
             for part in split_text_to_candidate_blocks(text):
@@ -1601,6 +1777,7 @@ def render_table(rows: list[list[str]], table_mode: str, cells: Optional[list[Ta
     if table_mode == "html" or (table_mode == "hybrid" and has_spans):
         return render_html_table(norm, cells)
     norm = drop_empty_table_columns(norm)
+    norm = [row for row in norm if any(cell.strip() for cell in row)]
     if not norm:
         return []
     header_source = norm[0]
@@ -1645,6 +1822,10 @@ def render_html_table(rows: list[list[str]], cells: Optional[list[TableCell]] = 
         for ridx in range(max_row):
             row_cells = sorted([cell for cell in cells if cell.row == ridx], key=lambda item: item.col)
             if not row_cells:
+                continue
+            # 내용이 전혀 없고 다른 셀의 rowspan이 걸치지도 않은 빈 행은 출력하지 않는다.
+            covered_by_span = any(cell.row < ridx < cell.row + cell.rowspan for cell in cells)
+            if ridx > 0 and not covered_by_span and all(not cell.text.strip() and cell.rowspan == 1 for cell in row_cells):
                 continue
             parts = []
             for cell in row_cells:
