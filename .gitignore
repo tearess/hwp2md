@@ -40,3 +40,5 @@ build/
 Thumbs.db
 
 .vercel
+
+.omc/
