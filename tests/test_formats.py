@@ -188,6 +188,43 @@ class DigitOnlyParagraphTests(unittest.TestCase):
         self.assertEqual(blocks, [])
 
 
+class PressReleaseNotesTests(unittest.TestCase):
+    def test_unrecognized_header_cells_are_kept_in_notes(self) -> None:
+        # 담당과장, 둘째 담당 부서처럼 정해진 항목이 아닌 칸의 글은 버리지 않고 notes에 남긴다.
+        cells = [
+            hwp2md.TableCell(row=0, col=0, text="보도자료"),
+            hwp2md.TableCell(row=1, col=0, text="보도일시"),
+            hwp2md.TableCell(row=1, col=1, text="2020. 9. 1."),
+            hwp2md.TableCell(row=1, col=2, text="배포일시"),
+            hwp2md.TableCell(row=1, col=3, text="2020. 8. 27."),
+            hwp2md.TableCell(row=2, col=0, text="담당과장"),
+            hwp2md.TableCell(row=2, col=1, text="예산총괄과장 박준호 (044-215-7110)"),
+            hwp2md.TableCell(row=3, col=0, text="담당자"),
+            hwp2md.TableCell(row=3, col=1, text="김영임 서기관(044-215-7111)"),
+            hwp2md.TableCell(row=3, col=2, text="예산정책과장 박창환 (044-215-7130)"),
+        ]
+
+        metadata = hwp2md.parse_press_release_metadata(cells)
+
+        self.assertEqual(metadata["release_at"], "2020. 9. 1.")
+        self.assertEqual(metadata["distributed_at"], "2020. 8. 27.")
+        self.assertEqual(metadata["contact"], "김영임 서기관(044-215-7111)")
+        notes = " ".join(metadata["notes"])
+        self.assertIn("박준호", notes)
+        self.assertIn("박창환", notes)
+        self.assertNotIn("보도일시", notes)
+
+    def test_no_notes_when_every_cell_is_recognized(self) -> None:
+        cells = [
+            hwp2md.TableCell(row=0, col=0, text="보도자료"),
+            hwp2md.TableCell(row=1, col=0, text="보도일시"),
+            hwp2md.TableCell(row=1, col=1, text="2020. 9. 1."),
+            hwp2md.TableCell(row=1, col=2, text="배포일시"),
+            hwp2md.TableCell(row=1, col=3, text="2020. 8. 27."),
+        ]
+        self.assertNotIn("notes", hwp2md.parse_press_release_metadata(cells))
+
+
 class CorruptFileTests(unittest.TestCase):
     def test_corrupt_ole_header_becomes_conversion_error(self) -> None:
         # OLE 시그니처는 맞지만 섹터 크기 값이 터무니없는 파일: olefile 내부 ValueError가 그대로 새어 나오면 안 된다.

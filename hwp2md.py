@@ -525,13 +525,18 @@ def parse_press_release_metadata(cells: list[TableCell]) -> dict[str, Any]:
         rows.setdefault(cell.row, []).append(cell)
 
     metadata: dict[str, Any] = {"document_type": "보도자료"}
-    for row_cells in rows.values():
+    notes: list[str] = []
+    for _, row_cells in sorted(rows.items()):
         ordered = sorted(row_cells, key=lambda item: item.col)
         texts = [clean_plain_text(cell.text.replace("\n", " ")) for cell in ordered]
         texts = [text for text in texts if text]
+        used: set[int] = set()
         for idx, text in enumerate(texts):
             label = re.sub(r"\s+", "", text)
-            value = next_metadata_value(texts, idx)
+            if label in PRESS_LABEL_WORDS:
+                used.add(idx)
+            value_index = next_metadata_value_index(texts, idx)
+            value = texts[value_index] if value_index is not None else None
             if label == "배포일시" and value:
                 metadata["distributed_at"] = value
             elif label == "보도일시" and value:
@@ -542,6 +547,13 @@ def parse_press_release_metadata(cells: list[TableCell]) -> dict[str, Any]:
                 metadata["department"] = value
             elif label == "담당자" and value:
                 metadata["contact"] = value
+            else:
+                continue
+            used.add(value_index)
+        # 위 항목으로 옮기지 못한 칸(담당과장, 둘째 이후 담당 부서, 엠바고 안내 등)은 버리지 않고 남긴다.
+        leftover = " ".join(text for idx, text in enumerate(texts) if idx not in used)
+        if leftover:
+            notes.append(leftover)
 
     if "contact" in metadata:
         phones = re.findall(r"\(?0\d{1,3}\)?[-)\s]?\d{3,4}[-\s]?\d{4}|\b\d{3,4}\b", metadata["contact"])
@@ -550,17 +562,25 @@ def parse_press_release_metadata(cells: list[TableCell]) -> dict[str, Any]:
         contacts = parse_press_contacts(metadata["contact"], metadata.get("department"))
         if contacts:
             metadata["contacts"] = contacts
+    if notes:
+        metadata["notes"] = notes
     return metadata
 
 
-def next_metadata_value(texts: list[str], label_index: int) -> Optional[str]:
-    label_words = {"보도자료", "배포일시", "보도일시", "담당", "부서", "담당부서", "담당/부서", "담당자"}
-    for value in texts[label_index + 1 :]:
-        compact = re.sub(r"\s+", "", value)
-        if compact in label_words:
+PRESS_LABEL_WORDS = frozenset({"보도자료", "배포일시", "보도일시", "담당", "부서", "담당부서", "담당/부서", "담당자"})
+
+
+def next_metadata_value_index(texts: list[str], label_index: int) -> Optional[int]:
+    for index in range(label_index + 1, len(texts)):
+        if re.sub(r"\s+", "", texts[index]) in PRESS_LABEL_WORDS:
             continue
-        return value
+        return index
     return None
+
+
+def next_metadata_value(texts: list[str], label_index: int) -> Optional[str]:
+    index = next_metadata_value_index(texts, label_index)
+    return texts[index] if index is not None else None
 
 
 def parse_press_contacts(text: str, department: Optional[str] = None) -> list[dict[str, str]]:
