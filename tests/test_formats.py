@@ -182,6 +182,27 @@ class CorruptFileTests(unittest.TestCase):
             with self.assertRaises(hwp2md.ConversionError):
                 hwp2md.convert_file(path, Path(tmp) / "out.md", None, None, hwp2md.ConvertOptions())
 
+    def test_truncated_ole_sector_becomes_conversion_error(self) -> None:
+        # 헤더는 정상이지만 FAT 섹터가 파일 밖을 가리키는 잘린 파일: olefile의 OleFileError가 새면 안 된다.
+        header = bytearray(512)
+        header[0:8] = hwp2md.HWP_CFB_SIGNATURE
+        header[24:26] = struct.pack("<H", 0x3E)
+        header[26:28] = struct.pack("<H", 3)
+        header[28:30] = struct.pack("<H", 0xFFFE)
+        header[30:32] = struct.pack("<H", 9)
+        header[32:34] = struct.pack("<H", 6)
+        header[44:48] = struct.pack("<I", 1)
+        header[48:52] = struct.pack("<I", 1)
+        header[56:60] = struct.pack("<I", 4096)
+        header[60:64] = struct.pack("<I", 0xFFFFFFFE)
+        header[76:80] = struct.pack("<I", 0)
+        header[80:512] = bytes([0xFF]) * 432
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "truncated.hwp"
+            path.write_bytes(bytes(header))
+            with self.assertRaises(hwp2md.ConversionError):
+                hwp2md.convert_file(path, Path(tmp) / "out.md", None, None, hwp2md.ConvertOptions())
+
     def test_truncated_zip_becomes_conversion_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "broken.hwpx"

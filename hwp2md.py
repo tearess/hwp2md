@@ -1912,6 +1912,11 @@ def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path]
         # 손상된 파일에서 olefile/zipfile/zlib 내부 오류가 그대로 보이지 않게 변환 오류로 바꾼다.
         # 코드 자체의 버그(TypeError 등)는 가리지 않도록 데이터 손상에서 나오는 예외만 잡는다.
         raise ConversionError(f"손상된 파일이거나 읽을 수 없는 구조입니다 ({type(exc).__name__}: {str(exc)[:120]})") from exc
+    except OSError as exc:
+        # olefile의 OleFileError/NotOleFileError는 OSError 하위 클래스다. 그 외 파일 입출력 오류는 그대로 둔다.
+        if not type(exc).__module__.startswith("olefile"):
+            raise
+        raise ConversionError(f"손상된 파일이거나 읽을 수 없는 구조입니다 ({type(exc).__name__}: {str(exc)[:120]})") from exc
 
     result.report["elapsedSeconds"] = round(time.time() - start, 3)
     output_path.write_text(result.markdown, encoding="utf-8")
