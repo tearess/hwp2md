@@ -252,10 +252,30 @@ class EmptyTableRowTests(unittest.TestCase):
         self.assertNotIn("<td></td><td></td>", html_out)
 
 
+class TabControlTests(unittest.TestCase):
+    def tab_unit(self, width: int = 0x0FA0) -> str:
+        # 탭 인라인 컨트롤: [9, 너비, 0, 0x100, 0, 0, 0, 9]
+        return "".join(chr(u) for u in (9, width, 0, 0x100, 0, 0, 0, 9))
+
+    def test_tab_payload_does_not_leak_into_text(self) -> None:
+        raw = "담당" + self.tab_unit() + "이름" + self.tab_unit(0x0A8C) + "끝"
+        text = hwp2md.clean_hwp_decoded_text(raw, skip_extended_controls=True)
+        self.assertEqual(text, "담당 이름 끝")
+        for ch in text:
+            self.assertFalse(0x0530 <= ord(ch) <= 0x1AFF, f"stray char U+{ord(ch):04X}")
+
+    def test_plain_tab_without_payload_is_kept(self) -> None:
+        self.assertEqual(hwp2md.clean_hwp_decoded_text("가" + chr(9) + "나", skip_extended_controls=True), "가 나")
+
+
 class SymbolFontTests(unittest.TestCase):
     def test_wingdings_private_use_glyphs_become_standard_symbols(self) -> None:
         raw = "설치" + chr(0xF09E) + "운영 " + chr(0xF53A) + "글 " + chr(0xF0FC)
         self.assertEqual(hwp2md.clean_hwp_decoded_text(raw, skip_extended_controls=True), "설치·운영 한글 ✓")
+
+    def test_context_verified_private_use_glyphs(self) -> None:
+        raw = "속기록" + chr(0xF85E) + "녹음 명칭" + chr(0xF0A0) + "위치 담당( " + chr(0xF028) + ": 229-3610) " + chr(0xF0FE) + "동의"
+        self.assertEqual(hwp2md.clean_hwp_decoded_text(raw, skip_extended_controls=True), "속기록·녹음 명칭·위치 담당( ☎: 229-3610) ☑동의")
 
     def test_leading_symbol_font_bullet_becomes_list_item(self) -> None:
         blocks: list[hwp2md.Block] = []

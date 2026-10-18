@@ -56,6 +56,8 @@ HWP_SYMBOL_FONT_MAP = {
     0xF081: "①", 0xF082: "②", 0xF083: "③", 0xF084: "④", 0xF085: "⑤",
     0xF086: "⑥", 0xF087: "⑦", 0xF088: "⑧", 0xF089: "⑨", 0xF08A: "⑩",
     0xF53A: "한",  # 한글 로고 글자
+    # 아래는 실제 문서의 문맥으로 용도를 확인한 항목이다: 단어 사이 가운뎃점(속기록·녹음), 문단 앞 불릿, 전화, 체크박스.
+    0xF85E: "·", 0xF0A0: "·", 0xF073: "◆", 0xF0A1: "○", 0xF028: "☎", 0xF0FE: "☑",
 }
 
 
@@ -228,7 +230,8 @@ def clean_hwp_decoded_text(s: str, skip_extended_controls: bool) -> str:
         code = ord(ch)
         if ch in "\r\n\t":
             out.append("\n" if ch in "\r\n" else "\t")
-            i += 1
+            # 탭(9)은 인라인 컨트롤이라 [9, 너비, ..., 9] 총 8유닛이다. 뒤 7유닛은 글자가 아니므로 건너뛴다.
+            i += 8 if ch == "\t" and i + 7 < len(s) and s[i + 7] == "\t" else 1
             continue
         if 24 <= code <= 31:
             # 24~31은 뒤에 데이터가 붙지 않는 1유닛 문자 제어문자다(24 하이픈, 30/31 묶음·고정폭 빈칸).
