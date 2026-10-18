@@ -401,7 +401,8 @@ def parse_hwp_table_records(
     for cell in sorted(cells, key=lambda item: (item.row, item.col)):
         for part in split_text_to_candidate_blocks(cell.text):
             is_first = not document_has_blocks and not flattened
-            append_text_block(flattened, part, heading_policy, is_first=is_first, include_page_artifacts=include_page_artifacts)
+            # 표 칸의 숫자는 쪽 번호가 아니라 데이터이므로 쪽 번호 필터를 적용하지 않는다.
+            append_text_block(flattened, part, heading_policy, is_first=is_first, include_page_artifacts=True)
     return flattened, idx
 
 

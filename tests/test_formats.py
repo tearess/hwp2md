@@ -94,6 +94,22 @@ class ListMarkerTests(unittest.TestCase):
         self.assertEqual(self.kind("(2) 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신합니다."), ("ordered_list", "위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신합니다."))
 
 
+class DigitOnlyTableCellTests(unittest.TestCase):
+    def test_digit_only_cells_are_not_dropped_as_page_numbers(self) -> None:
+        # 숫자만 있는 표 칸은 쪽 번호가 아니라 데이터다. 거의 빈 격자 표에서 전부 사라지면 안 된다.
+        ctrl = hwp2md.HWP_TABLE_CTRL_ID + bytes(8)
+        records = [
+            (hwp2md.HWP_CTRL_HEADER_TAG, 1, ctrl),
+            (hwp2md.HWP_TABLE_TAG, 2, rec_table(3, 3)),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(0, 0)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("1")),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(2, 2)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("2")),
+        ]
+        blocks, _ = hwp2md.parse_hwp_table_records(records, 0, "none", True, False)
+        self.assertEqual([b.text for b in blocks], ["1", "2"])
+
+
 class TableCaptionTests(unittest.TestCase):
     def test_caption_before_table_record_is_kept(self) -> None:
         # CTRL(tbl) 바로 뒤, TABLE 레코드보다 앞에 오는 문단 리스트는 캡션이며 셀이 아니다.
