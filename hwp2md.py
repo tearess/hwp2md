@@ -1210,8 +1210,8 @@ def strip_private_bullet(text: str) -> Optional[str]:
 
 def is_page_artifact_text(text: str) -> bool:
     stripped = text.strip()
-    if re.fullmatch(r"\d{1,3}", stripped):
-        return True
+    # 숫자만 있는 문단은 목차 번호·제목 번호·단 번호 같은 본문일 수 있어 지우지 않는다.
+    # 쪽 번호는 꼬리말 컨트롤로 따로 처리된다.
     if stripped in {"╣", "║", "│", "┃"}:
         return True
     return False
@@ -1306,7 +1306,7 @@ def infer_heading_level(text: str, policy: str, is_first: bool = False) -> Optio
     stripped = text.strip()
     if not stripped:
         return None
-    if is_first and len(stripped) <= 80:
+    if is_first and len(stripped) <= 80 and not stripped.isdigit():
         return 1
     if re.match(r"^(제\s*\d+\s*[장절관항]|제\s*[一二三四五六七八九十]+\s*[장절관항])\b", stripped) and len(stripped) <= 60:
         return 2

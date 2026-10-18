@@ -168,6 +168,26 @@ class HwpxTableTests(unittest.TestCase):
         self.assertEqual([b.type for b in blocks], ["table"])
 
 
+class DigitOnlyParagraphTests(unittest.TestCase):
+    def test_digit_only_paragraph_is_kept(self) -> None:
+        # 목차 번호·제목 번호·단 번호처럼 숫자만 있는 문단도 본문이므로 지우지 않는다.
+        blocks: list = []
+        hwp2md.append_text_block(blocks, "목차", "auto", is_first=True)
+        hwp2md.append_text_block(blocks, "01", "auto")
+        hwp2md.append_text_block(blocks, "18", "auto")
+        self.assertEqual([b.text for b in blocks], ["목차", "01", "18"])
+
+    def test_digit_only_first_paragraph_is_not_a_title(self) -> None:
+        blocks: list = []
+        hwp2md.append_text_block(blocks, "9", "auto", is_first=True)
+        self.assertEqual(blocks[0].type, "paragraph")
+
+    def test_page_border_glyphs_are_still_dropped(self) -> None:
+        blocks: list = []
+        hwp2md.append_text_block(blocks, "║", "auto")
+        self.assertEqual(blocks, [])
+
+
 class CorruptFileTests(unittest.TestCase):
     def test_corrupt_ole_header_becomes_conversion_error(self) -> None:
         # OLE 시그니처는 맞지만 섹터 크기 값이 터무니없는 파일: olefile 내부 ValueError가 그대로 새어 나오면 안 된다.
