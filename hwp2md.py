@@ -333,12 +333,15 @@ def parse_hwp_table_records(
         if idx > start_idx + 1 and rec_level <= table_level:
             break
 
-        if rec_tag == HWP_TABLE_TAG:
+        # 셀 안에 중첩된 표의 TABLE/LIST_HEADER 레코드는 바깥 표의 구조를 덮어쓰면 안 된다.
+        # 중첩 표의 문단 텍스트는 아래 PARA_TEXT 분기에서 현재 셀의 텍스트로 합쳐진다.
+        is_direct_child = rec_level == table_level + 1
+        if rec_tag == HWP_TABLE_TAG and is_direct_child:
             dims = parse_hwp_table_dimensions(rec_payload)
             if dims:
                 rows, cols = dims
                 saw_table_record = True
-        elif rec_tag == HWP_TABLE_CELL_TAG and rows and cols:
+        elif rec_tag == HWP_TABLE_CELL_TAG and rows and cols and is_direct_child:
             parsed_cell = parse_hwp_table_cell_header(rec_payload, rows, cols)
             if parsed_cell:
                 current_cell = parsed_cell
@@ -430,6 +433,9 @@ def is_page_artifact_table(rows: int, cols: int, cells: list[TableCell], grid: l
         return True
     if is_press_release_header_table(text):
         return True
+    # 수신자/제목이 들어 있는 공문 머리 표는 결재란과 한 표로 묶여 있어도 본문 정보이므로 보존한다.
+    if "수신자" in text or re.search(r"제\s*목", text):
+        return False
     # 결재란/시행란은 행 수가 적다. 행이 많은 큰 표는 신청서 같은 서식 본문이므로 버리지 않는다.
     if cols < 12 or rows > PAGE_ARTIFACT_MAX_ROWS:
         return False
@@ -1641,7 +1647,10 @@ def render_html_table(rows: list[list[str]], cells: Optional[list[TableCell]] = 
 
 
 def escape_table_cell(text: str) -> str:
-    return escape_md_text(text.replace("|", "\\|").replace("\n", "<br>"))
+    # 구조 문자 이스케이프를 먼저 하고 파이프/꺾쇠/줄바꿈을 처리해야 "\|"가 "\\|"로 겹치지 않는다.
+    # 셀 안의 "<...>"는 <br> 같은 HTML 태그로 해석되지 않도록 엔티티로 바꾼다.
+    escaped = escape_md_text(text).replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;")
+    return escaped.replace("\n", "<br>")
 
 
 def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path], report_path: Optional[Path], options: ConvertOptions) -> ConvertResult:
