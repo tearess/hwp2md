@@ -212,6 +212,15 @@ def clean_hwp_decoded_text(s: str, skip_extended_controls: bool) -> str:
             out.append("\n" if ch in "\r\n" else "\t")
             i += 1
             continue
+        if 24 <= code <= 31:
+            # 24~31은 뒤에 데이터가 붙지 않는 1유닛 문자 제어문자다(24 하이픈, 30/31 묶음·고정폭 빈칸).
+            # 확장 제어문자처럼 건너뛰면 뒤따르는 본문 글자를 삼키므로 문자 하나만 처리한다.
+            if code == 24:
+                out.append("-")
+            elif code in (30, 31):
+                out.append(" ")
+            i += 1
+            continue
         if code < 32:
             # 확장 제어문자는 대체로 control char + 4 UTF-16 units + control char 형태로 나타난다.
             if not skip_extended_controls:
@@ -325,6 +334,7 @@ def parse_hwp_table_records(
     cols: Optional[int] = None
     cells: list[TableCell] = []
     current_cell: Optional[TableCell] = None
+    caption_lines: list[str] = []
     idx = start_idx + 1
     saw_table_record = False
 
@@ -360,6 +370,11 @@ def parse_hwp_table_records(
             text = clean_hwp_text_payload(rec_payload)
             if text:
                 current_cell.text = "\n".join(part for part in [current_cell.text, text] if part)
+        elif current_cell is None and not saw_table_record and rec_tag == HWP_PARA_TEXT_TAG and rec_level > table_level + 1:
+            # TABLE 레코드보다 앞서 나오는 문단 리스트는 표 캡션이다. 셀이 아니므로 따로 모았다가 표 앞에 낸다.
+            caption = clean_hwp_text_payload(rec_payload)
+            if caption:
+                caption_lines.append(caption)
 
         idx += 1
 
@@ -375,10 +390,14 @@ def parse_hwp_table_records(
     if is_page_artifact_table(rows, cols, cells, grid) and not include_page_artifacts:
         dropped = " ".join(table_text.split())
         return ([Block(type="page_artifact", text=dropped)] if dropped else []), idx
+    caption_blocks: list[Block] = []
+    for caption in caption_lines:
+        for part in split_text_to_candidate_blocks(caption):
+            append_text_block(caption_blocks, part, heading_policy, is_first=not document_has_blocks and not caption_blocks, include_page_artifacts=include_page_artifacts)
     if should_render_hwp_table(rows, cols, cells, grid):
-        return [Block(type="table", rows=grid, cells=cells)], idx
+        return caption_blocks + [Block(type="table", rows=grid, cells=cells)], idx
 
-    flattened: list[Block] = []
+    flattened: list[Block] = list(caption_blocks)
     for cell in sorted(cells, key=lambda item: (item.row, item.col)):
         for part in split_text_to_candidate_blocks(cell.text):
             is_first = not document_has_blocks and not flattened
@@ -1108,7 +1127,7 @@ def append_text_block(
         level, heading_text = explicit_heading
         blocks.append(Block(type="heading", text=heading_text, level=level))
         return
-    list_match = re.match(r"^(?P<marker>(?:[-*+])|(?:[•·∙◦ㆍ□○〇■▶▷◇◆※ㅇ])|(?:\(?\d{1,3}\)?[.)](?!\d))|(?:[가-하]\.)|(?:[A-Za-z][.)]))\s*(?P<body>.+)$", text)
+    list_match = re.match(r"^(?P<marker>(?:[-*+])|(?:[•·∙◦ㆍ□○〇■▶▷◇◆※ㅇ])|(?:(?:\(\d{1,3}\)|\d{1,3}[.)])(?!\d))|(?:[가-하]\.)|(?:[A-Za-z][.)]))\s*(?P<body>.+)$", text)
     if list_match:
         marker = list_match.group("marker")
         body = list_match.group("body").strip()
@@ -1647,10 +1666,12 @@ def render_html_table(rows: list[list[str]], cells: Optional[list[TableCell]] = 
 
 
 def escape_table_cell(text: str) -> str:
-    # 구조 문자 이스케이프를 먼저 하고 파이프/꺾쇠/줄바꿈을 처리해야 "\|"가 "\\|"로 겹치지 않는다.
-    # 셀 안의 "<...>"는 <br> 같은 HTML 태그로 해석되지 않도록 엔티티로 바꾼다.
-    escaped = escape_md_text(text).replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;")
-    return escaped.replace("\n", "<br>")
+    # 셀 텍스트에는 줄바꿈을 뜻하는 "<br>"가 이미 들어 있을 수 있다. <br> 단위로 나눠 각 조각만 이스케이프한다.
+    # 구조 문자 이스케이프를 먼저 하고 파이프를 처리해야 "\|"가 "\\|"로 겹치지 않는다.
+    # 조각 안의 "<...>"는 HTML 태그로 해석되지 않도록 엔티티로 바꾼다.
+    parts = text.replace("\n", "<br>").split("<br>")
+    escaped = [escape_md_text(part).replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;") for part in parts]
+    return "<br>".join(escaped)
 
 
 def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path], report_path: Optional[Path], options: ConvertOptions) -> ConvertResult:

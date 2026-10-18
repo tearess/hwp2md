@@ -69,6 +69,62 @@ class TableCellEscapeTests(unittest.TestCase):
         self.assertEqual(cell, "가" + chr(92) + "|나 &lt;신 설&gt; 다" + chr(92) + "_라<br>마")
 
 
+class SingleUnitControlTests(unittest.TestCase):
+    def test_fixed_width_space_does_not_swallow_following_text(self) -> None:
+        # 0x1F(고정폭 빈칸)는 1유닛 문자다. 확장 제어문자로 오인해 뒤 글자를 건너뛰면 본문이 사라진다.
+        raw = "아래" + chr(31) + "표시" + chr(31) + "부동산에" + chr(31) + "관하여"
+        text = hwp2md.clean_hwp_decoded_text(raw, skip_extended_controls=True)
+        self.assertEqual(text, "아래 표시 부동산에 관하여")
+
+    def test_hyphen_control_becomes_hyphen(self) -> None:
+        raw = "가" + chr(24) + "나"
+        self.assertEqual(hwp2md.clean_hwp_decoded_text(raw, skip_extended_controls=True), "가-나")
+
+
+class ListMarkerTests(unittest.TestCase):
+    def kind(self, text: str):
+        blocks: list[hwp2md.Block] = []
+        hwp2md.append_text_block(blocks, text, "none", is_first=False)
+        return blocks[0].type, blocks[0].text
+
+    def test_parenthesized_date_is_not_a_list(self) -> None:
+        self.assertEqual(self.kind("(15. 10. 31. 현재)"), ("paragraph", "(15. 10. 31. 현재)"))
+
+    def test_paired_parenthesis_number_is_still_a_list(self) -> None:
+        self.assertEqual(self.kind("(2) 위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신합니다."), ("ordered_list", "위 호와 관련하여 입주자대표회의에서 요청한 사항에 대하여 아래와 같이 회신합니다."))
+
+
+class TableCaptionTests(unittest.TestCase):
+    def test_caption_before_table_record_is_kept(self) -> None:
+        # CTRL(tbl) 바로 뒤, TABLE 레코드보다 앞에 오는 문단 리스트는 캡션이며 셀이 아니다.
+        ctrl = hwp2md.HWP_TABLE_CTRL_ID + bytes(8)
+        records = [
+            (hwp2md.HWP_CTRL_HEADER_TAG, 1, ctrl),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, bytes(16)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("표 처리결과 캡션")),
+            (hwp2md.HWP_TABLE_TAG, 2, rec_table(2, 2)),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(0, 0)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("구분")),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(0, 1)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("2014년")),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(1, 0)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("조정률")),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(1, 1)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("19%")),
+        ]
+        blocks, _ = hwp2md.parse_hwp_table_records(records, 0, "none", True, False)
+        self.assertEqual(blocks[0].text, "표 처리결과 캡션")
+        self.assertEqual(blocks[-1].type, "table")
+        self.assertEqual([c.text for c in blocks[-1].cells], ["구분", "2014년", "조정률", "19%"])
+
+
+class TableCellBreakTests(unittest.TestCase):
+    def test_existing_line_break_markup_is_kept_while_text_is_escaped(self) -> None:
+        # 셀 텍스트에는 줄바꿈을 뜻하는 <br>가 이미 들어 있다. 이것까지 &lt;br&gt;로 바꾸면 안 된다.
+        self.assertEqual(hwp2md.escape_table_cell("전년대비<br>증감률"), "전년대비<br>증감률")
+        self.assertEqual(hwp2md.escape_table_cell("<신 설><br>가|나"), "&lt;신 설&gt;<br>가" + chr(92) + "|나")
+
+
 class NestedTableTests(unittest.TestCase):
     def test_nested_table_does_not_overwrite_outer_table_cells(self) -> None:
         # 바깥 표 1칸 안에 2x2 표가 있다. 안쪽 셀 위치(0,0)가 바깥 셀과 겹쳐도 바깥 문단이 사라지면 안 된다.

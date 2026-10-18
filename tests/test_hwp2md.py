@@ -270,8 +270,8 @@ class Hwp2MdSampleTests(unittest.TestCase):
 
         self.assertIn("metadata:", result.markdown)
         self.assertIn("distributed_at", result.markdown)
-        self.assertIn("2.6→(’13)0.5", result.markdown)
-        self.assertIn("14.7→(’13)38.2", result.markdown)
+        self.assertIn("2.6 → (’13) 0.5", result.markdown)
+        self.assertIn("14.7 → (’13) 38.2", result.markdown)
         self.assertNotIn("→)→", result.markdown)
         self.assertEqual(result.report["metadata"]["document_type"], "보도자료")
 
