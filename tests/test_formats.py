@@ -70,6 +70,32 @@ class TableCellEscapeTests(unittest.TestCase):
         self.assertEqual(cell, "가" + chr(92) + "|나 &lt;신 설&gt; 다" + chr(92) + "_라<br>마")
 
 
+class CellFootnoteTests(unittest.TestCase):
+    def test_footnote_inside_table_cell_is_inlined_without_dangling_marker(self) -> None:
+        ctrl = hwp2md.HWP_TABLE_CTRL_ID + bytes(8)
+        records = [
+            (hwp2md.HWP_CTRL_HEADER_TAG, 1, ctrl),
+            (hwp2md.HWP_TABLE_TAG, 2, rec_table(1, 2)),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(0, 0)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("금액")),
+            (hwp2md.HWP_CTRL_HEADER_TAG, 3, b"  nf" + bytes(8)),
+            (hwp2md.HWP_TABLE_CELL_TAG, 4, bytes(16)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 5, rec_text("각주 본문")),
+            (hwp2md.HWP_TABLE_CELL_TAG, 2, rec_cell(0, 1)),
+            (hwp2md.HWP_PARA_TEXT_TAG, 3, rec_text("비고")),
+        ]
+        blocks, next_idx = hwp2md.parse_hwp_table_records(records, 0, "none", True, False)
+        text = " ".join(b.text or "" for b in blocks)
+        self.assertIn("금액 (각주: 각주 본문)", text)
+        self.assertIn("비고", text)
+        self.assertNotIn("[^", text)
+        self.assertEqual(next_idx, len(records))
+
+    def test_count_cell_footnotes(self) -> None:
+        cell = hwp2md.TableCell(row=0, col=0, text="금액 (각주: 본문)")
+        self.assertEqual(hwp2md.count_cell_footnotes([hwp2md.Block(type="table", rows=[["x"]], cells=[cell])]), 1)
+
+
 class FootnoteAndHeaderTests(unittest.TestCase):
     def test_control_id_sets_use_little_endian_ids(self) -> None:
         self.assertIn(b"  nf", hwp2md.HWP_FOOTNOTE_CTRL_IDS)

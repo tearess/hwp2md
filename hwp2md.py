@@ -42,6 +42,7 @@ HWP_EQUATION_CTRL_IDS = {b"deqe", b"eqed"}
 HWP_FOOTNOTE_CTRL_IDS = {b"  nf", b"  ne"}
 # 머리말("head")/꼬리말("foot")도 같은 이유로 b"daeh"/b"toof"이다.
 HWP_HEADER_FOOTER_CTRL_IDS = {b"daeh", b"toof"}
+HWP_CELL_FOOTNOTE_OPEN = "(각주: "
 HWP_LAYOUT_CTRL_IDS = {b"dces", b"dloc", b"pngp", b"dhgp", b"onwn", b"spct", b"tcgp", b"daeh", b"toof"}
 HWP_FIELD_CTRL_IDS = {b"umf%", b"klc%"}
 HWP_PRIVATE_SQUARE_BULLET = "\U000f03da"
@@ -376,11 +377,15 @@ def parse_hwp_table_records(
         elif current_cell is not None and rec_tag == HWP_CTRL_HEADER_TAG and rec_level > table_level + 1:
             control_id = rec_payload[:4]
             addition: Optional[str] = None
+            if control_id in HWP_FOOTNOTE_CTRL_IDS:
+                footnote_text, next_idx = extract_hwp_footnote(records, idx)
+                if footnote_text:
+                    current_cell.text = f"{current_cell.text} {HWP_CELL_FOOTNOTE_OPEN}{footnote_text})".strip()
+                idx = next_idx
+                continue
             if control_id in HWP_EQUATION_CTRL_IDS:
                 equation = extract_hwp_equation(records, idx) or r"\text{HWP equation}"
                 addition = rf"\({equation}\)"
-            elif control_id in HWP_FOOTNOTE_CTRL_IDS:
-                addition = "[^hwp-footnote]"
             if addition:
                 current_cell.text = "\n".join(part for part in [current_cell.text, addition] if part)
         elif current_cell is not None and rec_tag == HWP_PARA_TEXT_TAG and rec_level > table_level + 1:
@@ -899,10 +904,6 @@ def is_footnote_placeholder(block: Block) -> bool:
     return block.type == "footnote" and (block.text or "").startswith("HWP 각주 내용은")
 
 
-def append_footnote_placeholder(blocks: list[Block], index: int) -> None:
-    blocks.append(Block(type="footnote", text=f"HWP 각주 내용은 원본 문서의 footnote control #{index}에 있습니다."))
-
-
 def count_blocks(blocks: list[Block], block_type: str) -> int:
     return sum(1 for block in content_blocks(blocks) if block.type == block_type)
 
@@ -919,13 +920,21 @@ def count_equation_fallbacks(blocks: list[Block]) -> int:
 
 
 def count_footnote_fallbacks(blocks: list[Block]) -> int:
-    total = sum(1 for block in blocks if is_footnote_placeholder(block))
+    return sum(1 for block in blocks if is_footnote_placeholder(block))
+
+
+def count_cell_footnotes(blocks: list[Block]) -> int:
+    """표 칸 안에 "(각주: ...)"로 복원된 각주 수."""
+    total = 0
     for block in content_blocks(blocks):
-        if block.type == "table":
-            if block.cells:
-                total += sum(cell.text.count("[^hwp-footnote]") for cell in block.cells)
-            elif block.rows:
-                total += sum(cell.count("[^hwp-footnote]") for row in block.rows for cell in row)
+        if block.type != "table":
+            # 표가 문단으로 풀린 경우에도 칸의 각주는 문단 텍스트 안에 들어 있다.
+            total += (block.text or "").count(HWP_CELL_FOOTNOTE_OPEN)
+            continue
+        if block.cells:
+            total += sum(cell.text.count(HWP_CELL_FOOTNOTE_OPEN) for cell in block.cells)
+        elif block.rows:
+            total += sum(cell.count(HWP_CELL_FOOTNOTE_OPEN) for row in block.rows for cell in row)
     return total
 
 
@@ -1033,6 +1042,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
         record_count = 0
         control_counts: dict[bytes, int] = {}
         seen_header_footer: set[str] = set()
+        empty_footnotes = 0
         repeated_header_footer = 0
         for section in sections:
             try:
@@ -1075,7 +1085,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                         if footnote_text:
                             blocks.append(Block(type="footnote", text=footnote_text))
                         else:
-                            append_footnote_placeholder(blocks, count_blocks(blocks, "footnote") + 1)
+                            empty_footnotes += 1
                         record_count += max(0, next_idx - idx - 1)
                         idx = next_idx
                         continue
@@ -1129,6 +1139,8 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                 "HEADER_FOOTER_REPEATS_COLLAPSED",
                 f"구역마다 반복되는 머리말/꼬리말 {repeated_header_footer}개는 처음 한 번만 남기고 제외했습니다.",
             ))
+        if empty_footnotes:
+            warnings.append(WarningItem("EMPTY_FOOTNOTES_SKIPPED", f"내용이 비어 있는 각주/미주 {empty_footnotes}개는 출력하지 않았습니다."))
         add_asset_position_warnings(assets, blocks, assets_dir, warnings, losses)
         footnote_fallback = count_footnote_fallbacks(blocks)
         add_hwp_control_warnings(
@@ -1137,7 +1149,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
             losses,
             equation_fallback_count=count_equation_fallbacks(blocks),
             footnote_fallback_count=footnote_fallback,
-            footnote_restored_count=max(0, count_blocks(blocks, "footnote") - sum(1 for b in blocks if is_footnote_placeholder(b))),
+            footnote_restored_count=max(0, count_blocks(blocks, "footnote") - sum(1 for b in blocks if is_footnote_placeholder(b))) + empty_footnotes + count_cell_footnotes(blocks),
         )
 
         report = build_report(input_path, "hwp", blocks, assets, warnings, losses)
