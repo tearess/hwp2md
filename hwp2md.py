@@ -209,6 +209,9 @@ def clean_plain_text(text: str) -> str:
     return "\n".join(compact).strip()
 
 
+HWP_EXTENDED_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x17]")
+
+
 def clean_hwp_text_payload(payload: bytes) -> str:
     """HWP PARA_TEXT 레코드에서 사람이 읽을 수 있는 문자열을 최대한 보수적으로 추출한다.
 
@@ -217,6 +220,9 @@ def clean_hwp_text_payload(payload: bytes) -> str:
     제거 결과가 본문을 잃었다고 판단되는 경우에는 제어문자 자체만 걷어낸 결과를 쓴다.
     """
     s = payload.decode("utf-16le", errors="ignore")
+    if not HWP_EXTENDED_CONTROL_RE.search(s):
+        # 확장 제어문자가 없으면 두 방식의 결과가 같으므로 한 번만 계산한다(대부분의 문단).
+        return clean_hwp_decoded_text(s, skip_extended_controls=True)
     structured = clean_hwp_decoded_text(s, skip_extended_controls=True)
     visible = clean_hwp_decoded_text(s, skip_extended_controls=False)
     if should_use_visible_hwp_text(structured, visible):
@@ -1728,7 +1734,10 @@ def select_inline_assets(assets: list[Asset], assets_dir: Path) -> list[Asset]:
         suffix = Path(asset.output).suffix.lower()
         if suffix not in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}:
             continue
-        width, height = image_dimensions(assets_dir / asset.output)
+        # 추출할 때 이미 잰 크기를 쓴다. 그림이 수천 개인 문서에서 파일을 매번 다시 읽으면 수십 초가 걸린다.
+        width, height = asset.width, asset.height
+        if width is None and height is None:
+            width, height = image_dimensions(assets_dir / asset.output)
         if width and height:
             if max(width, height) < 250:
                 continue
