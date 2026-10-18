@@ -135,18 +135,31 @@ class Hwp2MdUnitTests(unittest.TestCase):
     def test_clean_generated_assets_removes_only_current_stem_outputs(self) -> None:
         assets_dir = ROOT / "sample_output" / "_unit_assets"
         assets_dir.mkdir(exist_ok=True)
-        generated = assets_dir / "문서-001.bmp"
+        generated = assets_dir / "image-001.bmp"
+        unrelated = assets_dir / "image-002.png"
+        hwp2md.write_asset_manifest(assets_dir, [hwp2md.Asset(source="s", output="image-001.bmp", kind="image", bytes=1)])
+        legacy_generated = assets_dir / "문서-001.bmp"
         other = assets_dir / "다른문서-001.bmp"
         generated.write_bytes(b"old")
+        unrelated.write_bytes(b"keep")
+        legacy_generated.write_bytes(b"legacy")
         other.write_bytes(b"keep")
 
         removed = hwp2md.clean_generated_assets(assets_dir, "문서")
 
-        self.assertEqual(removed, 1)
+        self.assertEqual(removed, 2)
         self.assertFalse(generated.exists())
+        self.assertFalse(legacy_generated.exists())
         self.assertTrue(other.exists())
+        self.assertTrue(unrelated.exists(), "매니페스트에 없는 image-NNN 파일은 지우면 안 됩니다")
         other.unlink()
+        unrelated.unlink()
+        (assets_dir / hwp2md.ASSET_MANIFEST_NAME).unlink()
         assets_dir.rmdir()
+
+    def test_generated_asset_name_stays_short_for_long_source_names(self) -> None:
+        self.assertEqual(hwp2md.generated_asset_name(1, ".png"), "image-001.png")
+        self.assertLess(len(hwp2md.generated_asset_name(999, "jpeg")), 20)
 
     def test_render_markdown_places_image_anchor_once(self) -> None:
         assets_dir = ROOT / "sample_output" / "_unit_anchor.assets"

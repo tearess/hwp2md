@@ -25,6 +25,7 @@ from typing import Any, Iterable, Optional
 from xml.etree import ElementTree as ET
 
 VERSION = "0.1.0"
+ASSET_MANIFEST_NAME = ".hwp2md-assets.json"
 HWP_CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 HWP_SIGNATURE = b"HWP Document File"
 HWP_PARA_TEXT_TAG = 67
@@ -591,13 +592,35 @@ def clean_generated_assets(assets_dir: Path, stem: str) -> int:
     if not assets_dir.exists():
         return 0
     removed = 0
+    legacy_pattern = re.compile(re.escape(stem) + r"-\d{3}\.[0-9A-Za-z]+")
+    manifest_names = read_asset_manifest(assets_dir)
     for path in assets_dir.iterdir():
         if not path.is_file():
             continue
-        if re.fullmatch(re.escape(stem) + r"-\d{3}\.[0-9A-Za-z]+", path.name):
+        if path.name in manifest_names or legacy_pattern.fullmatch(path.name):
             path.unlink()
             removed += 1
     return removed
+
+
+def read_asset_manifest(assets_dir: Path) -> set[str]:
+    try:
+        data = json.loads((assets_dir / ASSET_MANIFEST_NAME).read_text(encoding="utf-8"))
+        return {name for name in data.get("files", []) if isinstance(name, str) and "/" not in name and "\\" not in name}
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def write_asset_manifest(assets_dir: Path, assets: list[Asset]) -> None:
+    if not assets:
+        return
+    payload = {"files": [asset.output for asset in assets]}
+    (assets_dir / ASSET_MANIFEST_NAME).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def generated_asset_name(index: int, ext: str) -> str:
+    ext = ext if ext.startswith(".") else f".{ext}"
+    return f"image-{index:03d}{ext}"
 
 
 def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode: str, warnings: list[WarningItem], clean_assets: bool = True) -> list[Asset]:
@@ -628,11 +651,12 @@ def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode:
             if png_data:
                 data = png_data
                 ext = ".png"
-        out_name = f"{stem}-{idx:03d}{ext}"
+        out_name = generated_asset_name(idx, ext)
         out_path = assets_dir / out_name
         out_path.write_bytes(data)
         width, height = image_dimensions_from_bytes(data)
         assets.append(Asset(source=ole_stream_name(stream), output=out_name, kind="image", bytes=len(data), index=parse_bindata_index(source_name), width=width, height=height))
+    write_asset_manifest(assets_dir, assets)
     return assets
 
 
@@ -1167,10 +1191,11 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
                     if png_data:
                         data = png_data
                         ext = ".png"
-                out_name = f"{stem}-{idx:03d}{ext}"
+                out_name = generated_asset_name(idx, ext)
                 (assets_dir / out_name).write_bytes(data)
                 width, height = image_dimensions_from_bytes(data)
                 assets.append(Asset(source=name, output=out_name, kind="image", bytes=len(data), index=parse_bindata_index(name), width=width, height=height))
+            write_asset_manifest(assets_dir, assets)
             if assets:
                 warnings.append(WarningItem("ASSET_POSITION_APPROXIMATED", "HWPX 이미지의 본문 내 배치 위치를 완전히 해석하지 못한 항목은 첨부 목록으로 보존합니다."))
 
@@ -1692,6 +1717,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not args.input:
             parser.error("input 파일 또는 --batch 패턴이 필요합니다.")
         input_path = Path(args.input)
+        if input_path.is_dir():
+            raise ConversionError(f"폴더는 직접 변환할 수 없습니다. --batch \"{input_path}/*.hwp\" 형식을 사용하세요.")
+        if not input_path.is_file():
+            raise ConversionError(f"입력 파일을 찾을 수 없습니다: {input_path}")
         output_path = Path(args.output) if args.output else input_path.with_suffix(".md")
         assets_dir = Path(args.assets_dir) if args.assets_dir else None
         report_path = Path(args.report) if args.report else None

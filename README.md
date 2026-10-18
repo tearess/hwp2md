@@ -32,6 +32,22 @@ python hwp2md.py input.hwpx -o docs/output.md --assets-dir docs/output.assets
 python hwp2md.py input.hwp --format obsidian --image-mode extract --table-mode gfm
 ```
 
+## GUI 프로그램 실행
+
+브라우저를 쓰지 않고 마우스로 파일을 고르는 프로그램 창을 열려면 GUI를 실행합니다.
+
+```powershell
+python hwp2md_gui.py
+```
+
+Windows에서는 배치 파일을 더블클릭하거나 다음처럼 실행할 수 있습니다.
+
+```powershell
+run_gui.bat
+```
+
+GUI에서 `파일 추가` 또는 `폴더 추가`를 누르고 `변환 시작`을 누르면 결과가 기본적으로 `converted` 폴더에 생성됩니다.
+
 ## 웹앱 실행
 
 브라우저에서 파일을 올려 변환하려면 로컬 웹앱을 실행합니다.

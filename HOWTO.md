@@ -185,6 +185,40 @@ Windows 배치 파일로 전체 변환:
 convert_all_hwp.bat converted
 ```
 
+## GUI 프로그램으로 사용하기
+
+`avi_compress`의 `run_gui.bat`처럼 마우스로 눌러서 쓰고 싶으면 GUI 프로그램을 실행하면 됩니다.
+
+프로젝트 폴더에서 아래 명령어를 실행합니다.
+
+```powershell
+python hwp2md_gui.py
+```
+
+또는 Windows에서는 아래 파일을 더블클릭해도 됩니다.
+
+```text
+run_gui.bat
+```
+
+GUI에서 하는 순서는 이렇습니다.
+
+1. `파일 추가` 또는 `폴더 추가`를 누릅니다.
+2. 변환할 `.hwp` 또는 `.hwpx` 파일을 목록에 넣습니다.
+3. 필요한 경우 결과 폴더와 변환 옵션을 고릅니다.
+4. `변환 시작`을 누릅니다.
+5. 끝나면 `결과 열기` 버튼으로 결과 폴더를 확인합니다.
+
+기본 결과 폴더는 프로젝트 폴더 안의 `converted`입니다.
+
+변환이 끝나면 파일마다 아래 결과가 생깁니다.
+
+```text
+문서이름.md
+문서이름.assets/
+문서이름.report.json
+```
+
 ## 9. 문제가 생겼을 때
 
 ### Python을 찾을 수 없다고 나오는 경우
@@ -264,7 +298,9 @@ README.md
 HOWTO.md
 hwp2md_dev_plan.md
 run_hwp2md.bat
+run_gui.bat
 run_webapp.bat
+hwp2md_gui.py
 webapp.py
 convert_all_hwp.bat
 tests/
