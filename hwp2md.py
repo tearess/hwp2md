@@ -29,6 +29,10 @@ ASSET_MANIFEST_NAME = ".hwp2md-assets.json"
 PAGE_ARTIFACT_MAX_ROWS = 8
 NON_CONTENT_BLOCK_TYPES = frozenset({"metadata", "page_artifact"})
 CORRUPT_FILE_ERRORS = (zipfile.BadZipFile, zlib.error, struct.error, ValueError, KeyError, EOFError, IndexError, ET.ParseError, RecursionError)
+# 압축 폭탄 대비 한도. 실제 문서 11,595개에서 본 최댓값은 섹션 34MB, 그림 하나 47MB, 문서 한 개의 그림 합계 595MB였다.
+MAX_SECTION_BYTES = 50 * 1024 * 1024
+MAX_ASSET_BYTES = 100 * 1024 * 1024
+MAX_TOTAL_ASSET_BYTES = 2 * 1024 * 1024 * 1024
 HWP_TEXT_LEAD_BYTES = b"\xef\xbb\xbf \t\r\n"
 HWP_CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 HWP_SIGNATURE = b"HWP Document File"
@@ -661,13 +665,56 @@ def normalize_phone_numbers(text: str) -> list[str]:
     return normalized
 
 
+class DecompressLimitError(ValueError):
+    pass
+
+
+class ZipMemberError(Exception):
+    pass
+
+
+def format_megabytes(size: int) -> str:
+    return f"{size / (1024 * 1024):.0f}MB"
+
+
+def bounded_zlib_decompress(data: bytes, wbits: int, limit: int) -> bytes:
+    # zlib.decompress와 같지만, 풀린 크기가 한도를 넘으면 끝까지 풀지 않고 멈춘다.
+    decompressor = zlib.decompressobj(wbits)
+    out = decompressor.decompress(data, limit + 1)
+    if len(out) > limit:
+        raise DecompressLimitError(f"압축을 푼 크기가 한도({format_megabytes(limit)})를 넘습니다")
+    if not decompressor.eof:
+        raise zlib.error("incomplete or truncated stream")
+    return out
+
+
+def read_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> bytes:
+    if info.file_size > limit:
+        raise ZipMemberError(f"압축을 푼 크기({format_megabytes(info.file_size)})가 한도({format_megabytes(limit)})를 넘습니다")
+    if info.flag_bits & 0x1:
+        raise ZipMemberError("암호가 걸린 항목입니다")
+    try:
+        # 헤더의 크기는 거짓일 수 있다. zipfile은 적힌 크기를 넘어서도 끝까지 풀기 때문에 실제로 읽는 양을 한도로 자른다.
+        with zf.open(info) as fp:
+            data = fp.read(limit + 1)
+    except NotImplementedError as exc:
+        raise ZipMemberError(f"지원하지 않는 압축 방식입니다 (method {info.compress_type})") from exc
+    except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
+        raise ZipMemberError(f"손상된 항목입니다 ({type(exc).__name__}: {str(exc)[:80]})") from exc
+    if len(data) > limit:
+        raise ZipMemberError(f"압축을 푼 크기가 한도({format_megabytes(limit)})를 넘습니다")
+    return data
+
+
 def read_hwp_stream(ole: Any, stream: list[str] | str, compressed: bool) -> bytes:
     data = ole.openstream(stream).read()
     if compressed:
         try:
-            return zlib.decompress(data, -15)
+            return bounded_zlib_decompress(data, -15, MAX_SECTION_BYTES)
+        except DecompressLimitError:
+            raise
         except zlib.error:
-            return zlib.decompress(data)
+            return bounded_zlib_decompress(data, 15, MAX_SECTION_BYTES)
     return data
 
 
@@ -786,10 +833,18 @@ def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode:
         removed = clean_generated_assets(assets_dir, stem)
         if removed:
             warnings.append(WarningItem("ASSETS_CLEANED", f"이전 변환에서 생성된 자산 {removed}개를 정리했습니다."))
+    total_bytes = 0
     for idx, stream in enumerate(bin_streams, start=1):
         source_name = stream[-1]
         raw_data = ole.openstream(stream).read()
-        data = decode_hwp_bindata(raw_data)
+        try:
+            data = decode_hwp_bindata(raw_data)
+            if total_bytes + len(data) > MAX_TOTAL_ASSET_BYTES:
+                raise DecompressLimitError(f"문서 전체 그림 크기가 한도({format_megabytes(MAX_TOTAL_ASSET_BYTES)})를 넘습니다")
+        except DecompressLimitError as exc:
+            warnings.append(WarningItem("ASSET_SKIPPED", f"{ole_stream_name(stream)}: {exc}", ole_stream_name(stream)))
+            continue
+        total_bytes += len(data)
         ext = Path(source_name).suffix.lower()
         if not ext:
             ext = guess_extension(data)
@@ -825,7 +880,9 @@ def decode_hwp_bindata(data: bytes) -> bytes:
         return data
     for wbits in (-15, 15):
         try:
-            decoded = zlib.decompress(data, wbits)
+            decoded = bounded_zlib_decompress(data, wbits, MAX_ASSET_BYTES)
+        except DecompressLimitError:
+            raise
         except zlib.error:
             continue
         if guess_extension(decoded) != ".bin":
@@ -1411,7 +1468,12 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
 
         for section_name in section_names:
             try:
-                root = ET.fromstring(zf.read(section_name))
+                section_data = read_zip_member(zf, zf.getinfo(section_name), MAX_SECTION_BYTES)
+            except ZipMemberError as exc:
+                warnings.append(WarningItem("HWPX_ENTRY_SKIPPED", f"{section_name}: {exc}", section_name))
+                continue
+            try:
+                root = ET.fromstring(section_data)
             except Exception as exc:
                 warnings.append(WarningItem("HWPX_XML_PARSE_FAILED", f"{section_name} 파싱 실패: {exc}", section_name))
                 continue
@@ -1426,8 +1488,17 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
                 removed = clean_generated_assets(assets_dir, stem)
                 if removed:
                     warnings.append(WarningItem("ASSETS_CLEANED", f"이전 변환에서 생성된 자산 {removed}개를 정리했습니다."))
+            total_bytes = 0
             for idx, name in enumerate(bin_names, start=1):
-                data = zf.read(name)
+                info = zf.getinfo(name)
+                try:
+                    if total_bytes + info.file_size > MAX_TOTAL_ASSET_BYTES:
+                        raise ZipMemberError(f"문서 전체 그림 크기가 한도({format_megabytes(MAX_TOTAL_ASSET_BYTES)})를 넘습니다")
+                    data = read_zip_member(zf, info, MAX_ASSET_BYTES)
+                except ZipMemberError as exc:
+                    warnings.append(WarningItem("ASSET_SKIPPED", f"{name}: {exc}", name))
+                    continue
+                total_bytes += len(data)
                 ext = Path(name).suffix.lower() or guess_extension(data)
                 if ext == ".bmp":
                     png_data = bmp_to_png(data)

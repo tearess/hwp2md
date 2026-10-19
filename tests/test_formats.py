@@ -1,6 +1,9 @@
 import struct
 import tempfile
 import unittest
+import zipfile
+import zlib
+from unittest import mock
 from xml.etree import ElementTree as ET
 from pathlib import Path
 
@@ -325,6 +328,112 @@ class CorruptFileTests(unittest.TestCase):
             path.write_bytes(b"PK" + bytes(30))
             with self.assertRaises(hwp2md.ConversionError):
                 hwp2md.convert_file(path, Path(tmp) / "out.md", None, None, hwp2md.ConvertOptions())
+
+
+LIMIT_SECTION_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?><hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" '
+    'xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"><hp:p><hp:run><hp:t>본문</hp:t></hp:run></hp:p></hs:sec>'
+)
+
+
+def write_limit_hwpx(path: Path, entries: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mimetype", "application/hwp+zip")
+        zf.writestr("Contents/section0.xml", LIMIT_SECTION_XML)
+        for name, data in entries.items():
+            zf.writestr(name, data)
+
+
+def patch_zip_header(path: Path, name: str, local_offset: int, central_offset: int, value: bytes) -> None:
+    # zipfile로는 만들 수 없는 항목(Deflate64, 틀린 CRC)을 시험하려고 지역·중앙 헤더의 값만 바꾼다.
+    data = bytearray(path.read_bytes())
+    encoded = name.encode()
+    for signature, field_offset, name_offset in ((b"PK\x03\x04", local_offset, 30), (b"PK\x01\x02", central_offset, 46)):
+        pos = data.find(signature)
+        while pos != -1:
+            if data[pos + name_offset : pos + name_offset + len(encoded)] == encoded:
+                data[pos + field_offset : pos + field_offset + len(value)] = value
+            pos = data.find(signature, pos + 1)
+    path.write_bytes(bytes(data))
+
+
+class ArchiveLimitTests(unittest.TestCase):
+    # 압축 폭탄: 작은 파일이 풀리면서 메모리와 디스크를 수백 배로 쓰지 않게 한도를 둔다.
+    def convert(self, path: Path) -> hwp2md.ConvertResult:
+        return hwp2md.convert_file(path, path.with_suffix(".md"), path.parent / "assets", None, hwp2md.ConvertOptions())
+
+    @staticmethod
+    def codes(result: hwp2md.ConvertResult) -> list[str]:
+        return [w["code"] for w in result.report["warnings"]]
+
+    def test_oversized_hwpx_image_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(hwp2md, "MAX_ASSET_BYTES", 1000):
+            path = Path(tmp) / "bomb.hwpx"
+            write_limit_hwpx(path, {"BinData/big.bin": bytes(5000), "BinData/small.png": b"\x89PNG" + bytes(100)})
+            result = self.convert(path)
+        self.assertIn("본문", result.markdown)
+        self.assertIn("ASSET_SKIPPED", self.codes(result))
+        self.assertEqual([a.source for a in result.assets], ["BinData/small.png"])
+
+    def test_total_hwpx_image_limit(self) -> None:
+        # 한도 바로 밑의 그림을 여러 개 넣은 경우도 문서 전체 합계로 막는다.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(hwp2md, "MAX_TOTAL_ASSET_BYTES", 3000):
+            path = Path(tmp) / "many.hwpx"
+            write_limit_hwpx(path, {f"BinData/b{i}.bin": bytes(2000) for i in range(3)})
+            result = self.convert(path)
+        self.assertEqual(len(result.assets), 1)
+        self.assertEqual(self.codes(result).count("ASSET_SKIPPED"), 2)
+
+    def test_oversized_hwpx_section_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(hwp2md, "MAX_SECTION_BYTES", 10):
+            path = Path(tmp) / "section.hwpx"
+            write_limit_hwpx(path, {})
+            result = self.convert(path)
+        self.assertIn("HWPX_ENTRY_SKIPPED", self.codes(result))
+        self.assertNotIn("본문", result.markdown)
+
+    def test_unsupported_compression_image_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deflate64.hwpx"
+            write_limit_hwpx(path, {"BinData/x.bin": bytes(100)})
+            patch_zip_header(path, "BinData/x.bin", 8, 10, struct.pack("<H", 9))
+            result = self.convert(path)
+        self.assertIn("본문", result.markdown)
+        self.assertIn("ASSET_SKIPPED", self.codes(result))
+        self.assertTrue(any("압축 방식" in w["message"] for w in result.report["warnings"]))
+
+    def test_understated_size_is_still_limited(self) -> None:
+        # 헤더에 실제보다 작은 크기를 적은 폭탄: 적힌 크기만 믿으면 끝까지 풀린다.
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(hwp2md, "MAX_ASSET_BYTES", 1000):
+            path = Path(tmp) / "liar.hwpx"
+            write_limit_hwpx(path, {"BinData/x.bin": bytes(5000)})
+            patch_zip_header(path, "BinData/x.bin", 22, 24, struct.pack("<I", 10))
+            result = self.convert(path)
+        self.assertIn("본문", result.markdown)
+        self.assertEqual(result.assets, [])
+        self.assertIn("ASSET_SKIPPED", self.codes(result))
+
+    def test_damaged_image_entry_does_not_fail_document(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "crc.hwpx"
+            write_limit_hwpx(path, {"BinData/x.bin": bytes(100)})
+            patch_zip_header(path, "BinData/x.bin", 14, 16, struct.pack("<I", 0x12345678))
+            result = self.convert(path)
+        self.assertIn("본문", result.markdown)
+        self.assertIn("ASSET_SKIPPED", self.codes(result))
+
+    def test_bounded_zlib_decompress(self) -> None:
+        raw = zlib.compress(bytes(5000))
+        self.assertEqual(hwp2md.bounded_zlib_decompress(raw, 15, 5000), bytes(5000))
+        with self.assertRaises(hwp2md.DecompressLimitError):
+            hwp2md.bounded_zlib_decompress(raw, 15, 4999)
+        with self.assertRaises(zlib.error):
+            hwp2md.bounded_zlib_decompress(raw[:-6], 15, 5000)
+
+    def test_hwp_bindata_over_limit_raises(self) -> None:
+        compressed = zlib.compress(bytes(5000))
+        with mock.patch.object(hwp2md, "MAX_ASSET_BYTES", 1000), self.assertRaises(hwp2md.DecompressLimitError):
+            hwp2md.decode_hwp_bindata(compressed)
 
 
 class ContentBlockPerformanceTests(unittest.TestCase):
