@@ -254,6 +254,36 @@ class PressContactPhoneTests(unittest.TestCase):
         self.assertTrue(all("phone" not in c for c in contacts))
 
 
+class PressContactNameTests(unittest.TestCase):
+    # 아래 담당자 칸은 실제 보도자료에서 그대로 가져왔다.
+    def people(self, contact: str) -> list[tuple[str, str]]:
+        return [(c["role"], c["name"]) for c in hwp2md.parse_press_contacts(contact, None)]
+
+    def test_name_before_role_with_phone_in_parentheses(self) -> None:
+        contacts = hwp2md.parse_press_contacts("김영임 서기관(044-215-7111)", None)
+        self.assertEqual(contacts, [{"role": "서기관", "name": "김영임", "phone": "044-215-7111"}])
+        self.assertEqual(self.people("이종민 사무관 (044-215-2851)"), [("사무관", "이종민")])
+
+    def test_phone_without_telephone_mark(self) -> None:
+        contacts = hwp2md.parse_press_contacts("검사 이시전 02) 2110-3504", None)
+        self.assertEqual(contacts, [{"role": "검사", "name": "이시전", "phone": "02) 2110-3504"}])
+
+    def test_middle_dot_separates_people(self) -> None:
+        contact = "∙과장 이명섭, 서기관 박진홍, 사무관 유지만·최민석·임유현 ∙☎ (044) 201-3321, 3324, 4129"
+        self.assertEqual(self.people(contact), [("과장", "이명섭"), ("서기관", "박진홍"), ("사무관", "유지만"), ("사무관", "최민석"), ("사무관", "임유현")])
+
+    def test_name_without_role_inherits_previous_role(self) -> None:
+        contact = "∙과장 김수상, 사무관 박용선, 조기재, 류종우 ∙☎ (044)201-3369, 3376(하자관련), 3374(관리관련)"
+        self.assertEqual(self.people(contact), [("과장", "김수상"), ("사무관", "박용선"), ("사무관", "조기재"), ("사무관", "류종우")])
+
+    def test_spaced_role_is_joined(self) -> None:
+        contact = "∙과 장 이문기, 사무관 전상억 ∙☎ (02)2110-8233 jsangeok@mltm.go.kr"
+        self.assertEqual(self.people(contact), [("과장", "이문기"), ("사무관", "전상억")])
+
+    def test_role_only_has_no_contact(self) -> None:
+        self.assertEqual(self.people("사무관"), [])
+
+
 class CorruptFileTests(unittest.TestCase):
     def test_corrupt_ole_header_becomes_conversion_error(self) -> None:
         # OLE 시그니처는 맞지만 섹터 크기 값이 터무니없는 파일: olefile 내부 ValueError가 그대로 새어 나오면 안 된다.

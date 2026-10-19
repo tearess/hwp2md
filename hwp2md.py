@@ -589,23 +589,44 @@ def next_metadata_value(texts: list[str], label_index: int) -> Optional[str]:
     return texts[index] if index is not None else None
 
 
+PRESS_ROLE_WORDS = frozenset({
+    "과장", "국장", "실장", "팀장", "단장", "반장", "소장", "부장", "차장", "계장", "주임", "센터장", "담당관",
+    "서기관", "사무관", "주무관", "행정관", "주사", "연구관", "연구사", "연구원", "전문관", "전문위원",
+    "기술서기관", "기술사무관", "행정사무관", "검사", "부장검사",
+})
+
+
 def parse_press_contacts(text: str, department: Optional[str] = None) -> list[dict[str, str]]:
     cleaned = re.sub(r"[∙•]", " ", text)
     parts = re.split(r"☎|전화|Tel\.?", cleaned, maxsplit=1, flags=re.I)
     people_text = parts[0]
-    phones = normalize_phone_numbers(parts[1] if len(parts) > 1 else "")
+    # ☎ 표시 없이 "김영임 서기관(044-215-7111)"처럼 이름 옆에 번호를 쓴 칸도 있다.
+    phones = normalize_phone_numbers(parts[1] if len(parts) > 1 else parts[0])
+    people_text = re.sub(r"\S+@\S+|\([^)]*\)|[\d()~-]+", " ", people_text)
+    for role in PRESS_ROLE_WORDS:
+        # "과 장"처럼 글자 사이를 띄어 쓴 직급을 붙인다.
+        people_text = re.sub(r"(?<![가-힣])" + r"\s+".join(role) + r"(?![가-힣])", role, people_text)
     people: list[dict[str, str]] = []
-    for item in re.split(r"[,/]", people_text):
-        item = item.strip()
-        if not item:
+    last_role = ""
+    for item in re.split(r"[,/·]", people_text):
+        tokens = item.split()
+        if not tokens:
             continue
-        match = re.search(r"(?P<role>[가-힣A-Za-z]+)\s+(?P<name>[가-힣]{2,4})$", item)
-        if not match:
-            continue
-        contact = {"role": match.group("role"), "name": match.group("name")}
-        if department:
-            contact["department"] = department
-        people.append(contact)
+        roles = [token for token in tokens if token in PRESS_ROLE_WORDS]
+        names = [token for token in tokens if token not in PRESS_ROLE_WORDS and re.fullmatch(r"[가-힣]{2,4}", token)]
+        if roles:
+            # 직급 목록으로 직급과 이름을 가리므로 "직급 이름"과 "이름 직급" 순서를 모두 읽는다.
+            last_role = roles[-1]
+        elif len(tokens) == 2 and re.fullmatch(r"[가-힣A-Za-z]+", tokens[0]) and len(names) == 2:
+            # 목록에 없는 직급은 예전처럼 "직급 이름" 순서로 본다.
+            last_role, names = tokens[0], [tokens[1]]
+        elif len(tokens) != 1 or not last_role:
+            continue  # 직급 없이 이름 하나만 있으면 앞 사람의 직급을 잇고, 그 밖에는 짐작하지 않는다.
+        for name in names:
+            contact = {"role": last_role, "name": name}
+            if department:
+                contact["department"] = department
+            people.append(contact)
     # 번호가 하나면 모두가 같이 쓰는 번호이고, 사람 수와 같을 때만 순서대로 짝짓는다. 그 밖에는 짐작하지 않는다.
     if len(phones) == 1:
         for contact in people:
