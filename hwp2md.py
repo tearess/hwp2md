@@ -562,7 +562,7 @@ def parse_press_release_metadata(cells: list[TableCell]) -> dict[str, Any]:
             notes.append(leftover)
 
     if "contact" in metadata:
-        phones = re.findall(r"\(?0\d{1,3}\)?[-)\s]?\d{3,4}[-\s]?\d{4}|\b\d{3,4}\b", metadata["contact"])
+        phones = normalize_phone_numbers(metadata["contact"])
         if phones:
             metadata["contact_phone"] = ", ".join(phones)
         contacts = parse_press_contacts(metadata["contact"], metadata.get("department"))
@@ -595,7 +595,7 @@ def parse_press_contacts(text: str, department: Optional[str] = None) -> list[di
     people_text = parts[0]
     phones = normalize_phone_numbers(parts[1] if len(parts) > 1 else "")
     people: list[dict[str, str]] = []
-    for idx, item in enumerate(re.split(r"[,/]", people_text)):
+    for item in re.split(r"[,/]", people_text):
         item = item.strip()
         if not item:
             continue
@@ -605,27 +605,38 @@ def parse_press_contacts(text: str, department: Optional[str] = None) -> list[di
         contact = {"role": match.group("role"), "name": match.group("name")}
         if department:
             contact["department"] = department
-        if idx < len(phones):
-            contact["phone"] = phones[idx]
-        elif len(phones) == 1:
-            contact["phone"] = phones[0]
         people.append(contact)
+    # 번호가 하나면 모두가 같이 쓰는 번호이고, 사람 수와 같을 때만 순서대로 짝짓는다. 그 밖에는 짐작하지 않는다.
+    if len(phones) == 1:
+        for contact in people:
+            contact["phone"] = phones[0]
+    elif len(phones) == len(people):
+        for contact, phone in zip(people, phones):
+            contact["phone"] = phone
     return people
 
 
 def normalize_phone_numbers(text: str) -> list[str]:
     if not text:
         return []
-    text = text.strip()
-    prefix_match = re.search(r"\(?0\d{1,3}\)?", text)
-    prefix = prefix_match.group(0) if prefix_match else ""
+    # "201 - 3402"처럼 하이픈 앞뒤에 공백을 둔 번호가 조각나지 않도록 먼저 붙인다.
+    text = re.sub(r"\s*-\s*", "-", text.strip())
     numbers = re.findall(r"(?:\(?0\d{1,3}\)?[-)\s]?)?\d{3,4}[-\s]?\d{4}|\b\d{3,4}\b", text)
     normalized: list[str] = []
+    last_full = ""
     for number in numbers:
-        number = number.strip()
-        if prefix and not re.search(r"^(0|\()", number):
-            number = f"{prefix}-{number}"
-        normalized.append(re.sub(r"\s+", " ", number))
+        number = re.sub(r"\s+", " ", number.strip())
+        if re.fullmatch(r"\d{3,4}", number):
+            if number.startswith("0"):
+                continue  # 지역번호만 따로 떨어진 조각
+            if last_full:
+                # "201-3398, 3400"은 앞 번호의 끝자리만 바꿔 쓴 201-3400이다.
+                number = last_full[: -len(number)] + number
+        else:
+            if number.startswith("(") and ")" not in number:
+                number = number[1:]  # "서기관(044-215-7111)"에서 여는 괄호만 따라온 경우
+            last_full = number
+        normalized.append(number)
     return normalized
 
 

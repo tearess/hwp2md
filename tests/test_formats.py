@@ -225,6 +225,35 @@ class PressReleaseNotesTests(unittest.TestCase):
         self.assertNotIn("notes", hwp2md.parse_press_release_metadata(cells))
 
 
+class PressContactPhoneTests(unittest.TestCase):
+    # 아래 담당자 칸은 저장소의 실제 보도자료와 공개 샘플에서 그대로 가져왔다.
+    def test_shortened_numbers_keep_exchange(self) -> None:
+        # "201-3398, 3400"은 국번이 같은 201-3400이라는 뜻이다.
+        contact = "∙과장 김상석, 사무관 이승흥, 주무관 윤동영 ∙☎ (044)201-3398, 3400, 3408"
+        contacts = hwp2md.parse_press_contacts(contact, "토지정책과")
+        self.assertEqual([c["phone"] for c in contacts], ["(044)201-3398", "(044)201-3400", "(044)201-3408"])
+
+    def test_spaced_hyphen_is_one_shared_number(self) -> None:
+        contact = "∙과장 김상석, 사무관 박태진, 주무관 성기준 ∙☎ (044) 201 - 3402"
+        self.assertEqual(hwp2md.normalize_phone_numbers(contact), ["(044) 201-3402"])
+        contacts = hwp2md.parse_press_contacts(contact, "토지정책과")
+        self.assertEqual([c["phone"] for c in contacts], ["(044) 201-3402"] * 3)
+
+    def test_contact_phone_has_no_unbalanced_parenthesis(self) -> None:
+        cells = [
+            hwp2md.TableCell(row=0, col=0, text="보도자료"),
+            hwp2md.TableCell(row=1, col=0, text="담당자"),
+            hwp2md.TableCell(row=1, col=1, text="김영임 서기관(044-215-7111)"),
+        ]
+        self.assertEqual(hwp2md.parse_press_release_metadata(cells)["contact_phone"], "044-215-7111")
+
+    def test_phone_count_mismatch_assigns_no_phone(self) -> None:
+        # 번호 수가 사람 수와 다르면 누구의 번호인지 알 수 없으므로 짐작해서 붙이지 않는다.
+        contacts = hwp2md.parse_press_contacts("과장 김상석, 사무관 이승흥, 주무관 윤동영 ☎ 044-201-3398, 3400", None)
+        self.assertEqual(len(contacts), 3)
+        self.assertTrue(all("phone" not in c for c in contacts))
+
+
 class CorruptFileTests(unittest.TestCase):
     def test_corrupt_ole_header_becomes_conversion_error(self) -> None:
         # OLE 시그니처는 맞지만 섹터 크기 값이 터무니없는 파일: olefile 내부 ValueError가 그대로 새어 나오면 안 된다.
