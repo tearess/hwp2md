@@ -218,6 +218,19 @@ class PressReleaseNotesTests(unittest.TestCase):
         self.assertIn("박창환", notes)
         self.assertNotIn("보도일시", notes)
 
+    def test_label_and_value_in_one_cell(self) -> None:
+        cells = [
+            hwp2md.TableCell(row=0, col=0, text="보도자료"),
+            hwp2md.TableCell(row=0, col=1, text="www.ftc.go.kr"),
+            hwp2md.TableCell(row=1, col=0, text="배포일시 2012.8.28(화)"),
+            hwp2md.TableCell(row=2, col=0, text="보도일시"),
+            hwp2md.TableCell(row=2, col=1, text="2012.8.29(수) 조간부터 보도가능"),
+        ]
+        metadata = hwp2md.parse_press_release_metadata(cells)
+        self.assertEqual(metadata["distributed_at"], "2012.8.28(화)")
+        self.assertEqual(metadata["release_at"], "2012.8.29(수) 조간부터 보도가능")
+        self.assertEqual(metadata["notes"], ["www.ftc.go.kr"])
+
     def test_no_notes_when_every_cell_is_recognized(self) -> None:
         cells = [
             hwp2md.TableCell(row=0, col=0, text="보도자료"),
@@ -286,6 +299,13 @@ class PressContactNameTests(unittest.TestCase):
 
     def test_role_only_has_no_contact(self) -> None:
         self.assertEqual(self.people("사무관"), [])
+
+    def test_two_people_without_comma(self) -> None:
+        contacts = hwp2md.parse_press_contacts("과 장 이원두 051)460-1030 조사관 이효권 051)460-1034", None)
+        self.assertEqual([(c["role"], c["name"], c["phone"]) for c in contacts], [("과장", "이원두", "051)460-1030"), ("조사관", "이효권", "051)460-1034")])
+
+    def test_two_people_name_first_without_comma(self) -> None:
+        self.assertEqual(self.people("김영임 서기관 이종민 사무관"), [("서기관", "김영임"), ("사무관", "이종민")])
 
 
 class CorruptFileTests(unittest.TestCase):

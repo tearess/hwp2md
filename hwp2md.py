@@ -543,10 +543,15 @@ def parse_press_release_metadata(cells: list[TableCell]) -> dict[str, Any]:
         used: set[int] = set()
         for idx, text in enumerate(texts):
             label = re.sub(r"\s+", "", text)
+            inline = None if label in PRESS_LABEL_WORDS else PRESS_INLINE_LABEL_RE.match(text)
             if label in PRESS_LABEL_WORDS:
                 used.add(idx)
-            value_index = next_metadata_value_index(texts, idx)
-            value = texts[value_index] if value_index is not None else None
+            if inline:
+                # "배포일시 2012.8.28(화)"처럼 항목 이름과 값이 한 칸에 같이 있는 경우
+                label, value_index, value = re.sub(r"\s+", "", inline.group(1)), idx, inline.group(2)
+            else:
+                value_index = next_metadata_value_index(texts, idx)
+                value = texts[value_index] if value_index is not None else None
             if label == "배포일시" and value:
                 metadata["distributed_at"] = value
             elif label == "보도일시" and value:
@@ -578,6 +583,9 @@ def parse_press_release_metadata(cells: list[TableCell]) -> dict[str, Any]:
 
 
 PRESS_LABEL_WORDS = frozenset({"보도자료", "배포일시", "보도일시", "담당", "부서", "담당부서", "담당/부서", "담당자"})
+PRESS_INLINE_LABEL_RE = re.compile(
+    r"^(" + "|".join(r"\s*".join(word) for word in ("배포일시", "보도일시", "담당부서", "담당자")) + r")\s*[:：]?\s*(\S.*)$"
+)
 
 
 def next_metadata_value_index(texts: list[str], label_index: int) -> Optional[int]:
@@ -597,6 +605,7 @@ PRESS_ROLE_WORDS = frozenset({
     "과장", "국장", "실장", "팀장", "단장", "반장", "소장", "부장", "차장", "계장", "주임", "센터장", "담당관",
     "서기관", "사무관", "주무관", "행정관", "주사", "연구관", "연구사", "연구원", "전문관", "전문위원",
     "기술서기관", "기술사무관", "행정사무관", "검사", "부장검사",
+    "조사관", "감사관", "심판관", "정책관", "기획관", "협력관", "대변인", "공보관", "서기", "위원",
 })
 
 
@@ -616,18 +625,33 @@ def parse_press_contacts(text: str, department: Optional[str] = None) -> list[di
         tokens = item.split()
         if not tokens:
             continue
-        roles = [token for token in tokens if token in PRESS_ROLE_WORDS]
-        names = [token for token in tokens if token not in PRESS_ROLE_WORDS and re.fullmatch(r"[가-힣]{2,4}", token)]
-        if roles:
+        is_name = lambda token: token not in PRESS_ROLE_WORDS and re.fullmatch(r"[가-힣]{2,4}", token)
+        pairs: list[tuple[str, str]] = []
+        if any(token in PRESS_ROLE_WORDS for token in tokens):
             # 직급 목록으로 직급과 이름을 가리므로 "직급 이름"과 "이름 직급" 순서를 모두 읽는다.
-            last_role = roles[-1]
-        elif len(tokens) == 2 and re.fullmatch(r"[가-힣A-Za-z]+", tokens[0]) and len(names) == 2:
+            # 쉼표 없이 여러 사람을 이어 쓴 경우("과장 이원두 조사관 이효권")도 순서대로 짝짓는다.
+            role_first = tokens[0] in PRESS_ROLE_WORDS
+            pending: list[str] = []
+            for token in tokens:
+                if token in PRESS_ROLE_WORDS:
+                    if not role_first:
+                        pairs += [(token, name) for name in pending]
+                        pending = []
+                    last_role = token
+                elif is_name(token):
+                    if role_first:
+                        pairs.append((last_role, token))
+                    else:
+                        pending.append(token)
+            pairs += [(last_role, name) for name in pending]
+        elif len(tokens) == 2 and re.fullmatch(r"[가-힣A-Za-z]+", tokens[0]) and is_name(tokens[1]):
             # 목록에 없는 직급은 예전처럼 "직급 이름" 순서로 본다.
-            last_role, names = tokens[0], [tokens[1]]
-        elif len(tokens) != 1 or not last_role:
-            continue  # 직급 없이 이름 하나만 있으면 앞 사람의 직급을 잇고, 그 밖에는 짐작하지 않는다.
-        for name in names:
-            contact = {"role": last_role, "name": name}
+            last_role = tokens[0]
+            pairs.append((last_role, tokens[1]))
+        elif len(tokens) == 1 and last_role and is_name(tokens[0]):
+            pairs.append((last_role, tokens[0]))  # 직급 없이 이름 하나만 있으면 앞 사람의 직급을 잇는다.
+        for role, name in pairs:
+            contact = {"role": role, "name": name}
             if department:
                 contact["department"] = department
             people.append(contact)
