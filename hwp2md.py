@@ -1427,9 +1427,12 @@ def infer_heading_level(text: str, policy: str, is_first: bool = False) -> Optio
         return 2
     if re.match(r"^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[.)]\s+", stripped) and len(stripped) <= 60:
         return 2
-    if re.match(r"^\d+\.\s+\S", stripped) and len(stripped) <= 80:
+    # 번호가 붙어도 문장으로 끝나는 조항·목록 항목("…하여야 한다.", "…일 것", "…에 따른다:")과
+    # 연도로 시작하는 날짜("2016. 8. 12. 시행된 …")는 제목이 아니다.
+    numbered_body = re.search(r"(?:다|것)\.?$|:$", stripped) or re.match(r"^(?:1[89]|20)\d{2}\.\s*\d{1,2}\.", stripped)
+    if re.match(r"^\d+\.\s+\S", stripped) and len(stripped) <= 80 and not numbered_body:
         return 2
-    if re.match(r"^\d+(?:\.\d+)+\.?\s+\S", stripped) and len(stripped) <= 90:
+    if re.match(r"^\d+(?:\.\d+)+\.?\s+\S", stripped) and len(stripped) <= 90 and not numbered_body:
         depth = stripped.split()[0].count(".")
         return min(6, max(3, depth + 1))
     if policy == "font" and len(stripped) <= 40:
@@ -1459,6 +1462,8 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
 
     with zipfile.ZipFile(input_path) as zf:
         names = zf.namelist()
+        if is_encrypted_hwpx(zf, names):
+            raise ConversionError("암호화된 HWPX 문서는 지원하지 않습니다. 한글에서 암호를 해제한 뒤 다시 변환하세요.")
         section_names = sorted([n for n in names if re.search(r"(?:^|/)section\d+\.xml$", n, re.I)])
         if not section_names:
             # 일부 HWPX는 Contents/content.hpf에서 section 목록을 간접 참조한다.
@@ -1522,12 +1527,25 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
     return ConvertResult(markdown=markdown, report=report, blocks=blocks, assets=assets)
 
 
+def is_encrypted_hwpx(zf: zipfile.ZipFile, names: list[str]) -> bool:
+    # 암호를 건 HWPX는 META-INF/manifest.xml의 항목마다 ODF 방식의 encryption-data를 적는다.
+    manifest = next((n for n in names if n.lower() == "meta-inf/manifest.xml"), None)
+    if manifest is None:
+        return False
+    try:
+        data = read_zip_member(zf, zf.getinfo(manifest), MAX_SECTION_BYTES)
+    except ZipMemberError:
+        return False
+    return b"encryption-data" in data
+
+
 def local_name(elem: ET.Element) -> str:
     return elem.tag.rsplit("}", 1)[-1] if "}" in elem.tag else elem.tag
 
 
 def collect_text(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
-    return clean_plain_text(collect_text_with_inline_styles(elem, skip))
+    # HWPX도 HWP와 같이 Wingdings/Symbol 글꼴 기호를 사용자 정의 영역 글자로 저장한다.
+    return clean_plain_text(collect_text_with_inline_styles(elem, skip).translate(HWP_SYMBOL_FONT_MAP))
 
 
 def collect_text_with_inline_styles(elem: ET.Element, skip: Optional[set[int]] = None) -> str:

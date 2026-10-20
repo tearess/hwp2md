@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import zipfile
 import zlib
+from typing import Optional
 from unittest import mock
 from xml.etree import ElementTree as ET
 from pathlib import Path
@@ -434,6 +435,62 @@ class ArchiveLimitTests(unittest.TestCase):
         compressed = zlib.compress(bytes(5000))
         with mock.patch.object(hwp2md, "MAX_ASSET_BYTES", 1000), self.assertRaises(hwp2md.DecompressLimitError):
             hwp2md.decode_hwp_bindata(compressed)
+
+
+class HwpxSymbolFontTests(unittest.TestCase):
+    def test_symbol_font_characters_are_mapped_in_hwpx(self) -> None:
+        # 실제 HWPX에서 본 Wingdings 글머리표: 그대로 두면 사용자 정의 영역 글자로 보인다.
+        xml = (
+            '<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">'
+            '<hp:p><hp:run><hp:t> 여론 상황 분석</hp:t></hp:run></hp:p>'
+            '<hp:p><hp:run><hp:t>학생역량 개선  진로심리상담</hp:t></hp:run></hp:p></hs:sec>'
+        )
+        # 문단 앞의 기호는 HWP와 같이 글머리표 목록이 된다.
+        blocks = [(block.type, block.text) for block in hwpx_blocks(xml)]
+        self.assertEqual(blocks, [("bullet_list", "여론 상황 분석"), ("paragraph", "학생역량 개선 · 진로심리상담")])
+
+
+class EncryptedHwpxTests(unittest.TestCase):
+    def test_password_protected_hwpx_is_reported(self) -> None:
+        manifest = (
+            '<odf:manifest xmlns:odf="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">'
+            '<odf:file-entry full-path="Contents/section0.xml" media-type="application/xml">'
+            '<odf:encryption-data checksum-type="sha256-1k" checksum="x"/></odf:file-entry></odf:manifest>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "password.hwpx"
+            write_limit_hwpx(path, {"META-INF/manifest.xml": manifest.encode()})
+            with self.assertRaisesRegex(hwp2md.ConversionError, "암호"):
+                hwp2md.convert_file(path, path.with_suffix(".md"), None, None, hwp2md.ConvertOptions())
+
+    def test_empty_manifest_is_not_encrypted(self) -> None:
+        manifest = b'<odf:manifest xmlns:odf="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"/>'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plain.hwpx"
+            write_limit_hwpx(path, {"META-INF/manifest.xml": manifest})
+            result = hwp2md.convert_file(path, path.with_suffix(".md"), None, None, hwp2md.ConvertOptions())
+        self.assertIn("본문", result.markdown)
+
+
+class NumberedSentenceHeadingTests(unittest.TestCase):
+    # 아래 문장은 실제 기준·규정 문서에서 가져왔다.
+    def level(self, text: str) -> Optional[int]:
+        return hwp2md.infer_heading_level(text, "font")
+
+    def test_numbered_clause_sentence_is_not_heading(self) -> None:
+        self.assertIsNone(self.level("4.2.2.8 기관구역은 어떠한 운전상태에서도 충분히 통풍되어야 한다."))
+        self.assertIsNone(self.level("4.3.3.12 각 펌프의 용량은 다음 식에 따른다:"))
+        self.assertIsNone(self.level("6.2.2.2 염산 KS M 1206에 규정된 것"))
+        self.assertIsNone(self.level("1. 피보증인의 명의가 “갑”일 것"))
+
+    def test_date_is_not_numbered_heading(self) -> None:
+        self.assertIsNone(self.level("2016. 8. 12. 시행된 공동주택관리법이 적용되는 아파트"))
+        self.assertIsNone(self.level("1945.8.15. 해방 이후 제헌헌법 제정"))
+
+    def test_numbered_titles_stay_headings(self) -> None:
+        self.assertEqual(self.level("1. 추진 배경"), 2)
+        self.assertEqual(self.level("3.1.2 수면비행선박의 복원성"), 3)
+        self.assertEqual(self.level("6.4 옴부즈만"), 3)
 
 
 class ContentBlockPerformanceTests(unittest.TestCase):
