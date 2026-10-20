@@ -7,6 +7,7 @@ import os
 import platform
 import queue
 import subprocess
+import sys
 import threading
 import traceback
 from pathlib import Path
@@ -21,6 +22,26 @@ APP_ROOT = Path(__file__).resolve().parent
 SUPPORTED_SUFFIXES = {".hwp", ".hwpx"}
 
 
+def default_output_dir() -> Path:
+    # 실행 파일(PyInstaller)로 묶이면 APP_ROOT가 실행할 때마다 지워지는 임시 압축 해제 폴더이므로 문서 폴더에 둔다.
+    if getattr(sys, "frozen", False):
+        documents = Path.home() / "Documents"
+        return (documents if documents.is_dir() else Path.home()) / "hwp2md 변환결과"
+    return APP_ROOT / "converted"
+
+
+def expand_input_paths(paths: list[str]) -> list[Path]:
+    """명령줄 인수(exe 아이콘에 끌어다 놓은 파일·폴더)를 파일 목록으로 푼다. 확장자는 add_paths가 거른다."""
+    found: list[Path] = []
+    for raw in paths:
+        path = Path(raw)
+        if path.is_dir():
+            found.extend(p for p in path.rglob("*") if p.is_file())
+        else:
+            found.append(path)
+    return found
+
+
 class Hwp2MdGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -29,7 +50,7 @@ class Hwp2MdGui:
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
 
-        self.output_dir = tk.StringVar(value=str(APP_ROOT / "converted"))
+        self.output_dir = tk.StringVar(value=str(default_output_dir()))
         self.recursive = tk.BooleanVar(value=True)
         self.table_mode = tk.StringVar(value="hybrid")
         self.image_mode = tk.StringVar(value="extract")
@@ -340,9 +361,12 @@ class Hwp2MdGui:
         self.root.destroy()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     root = tk.Tk()
-    Hwp2MdGui(root)
+    app = Hwp2MdGui(root)
+    initial = sys.argv[1:] if argv is None else argv
+    if initial:
+        app.add_paths(expand_input_paths(initial))
     root.mainloop()
     return 0
 
