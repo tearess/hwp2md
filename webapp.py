@@ -32,7 +32,7 @@ MAX_UPLOAD_BYTES = int(
         VERCEL_MAX_UPLOAD_BYTES if os.environ.get("VERCEL") else LOCAL_MAX_UPLOAD_BYTES,
     )
 )
-SUPPORTED_SUFFIXES = {".hwp", ".hwpx"}
+SUPPORTED_SUFFIXES = {".hwp", ".hwpx", ".hml"}
 APP_ROOT = Path(__file__).resolve().parent
 APP_TMP_ROOT = Path(
     os.environ.get(
@@ -317,7 +317,7 @@ def html_page(message: str | None = None, message_kind: str = "error") -> bytes:
       <form id="convertForm" action="/convert" method="post" enctype="multipart/form-data">
         <div>
           <label for="documents">문서 선택</label>
-          <input id="documents" name="documents" type="file" accept=".hwp,.hwpx" multiple required data-max-upload-bytes="{MAX_UPLOAD_BYTES}">
+          <input id="documents" name="documents" type="file" accept=".hwp,.hwpx,.hml" multiple required data-max-upload-bytes="{MAX_UPLOAD_BYTES}">
           <div class="upload-limit">전체 업로드 크기는 {max_upload_mb}MB 이하로 제한됩니다.</div>
           <div id="fileList" class="files" role="status" aria-live="polite"></div>
         </div>

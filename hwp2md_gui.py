@@ -19,7 +19,7 @@ import hwp2md
 
 
 APP_ROOT = Path(__file__).resolve().parent
-SUPPORTED_SUFFIXES = {".hwp", ".hwpx"}
+SUPPORTED_SUFFIXES = {".hwp", ".hwpx", ".hml"}
 
 
 def default_output_dir() -> Path:
@@ -170,7 +170,7 @@ class Hwp2MdGui:
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(
             title="HWP/HWPX 파일 선택",
-            filetypes=(("HWP/HWPX 문서", "*.hwp *.hwpx"), ("모든 파일", "*.*")),
+            filetypes=(("HWP/HWPX 문서", "*.hwp *.hwpx *.hml"), ("모든 파일", "*.*")),
         )
         self.add_paths(Path(path) for path in paths)
 

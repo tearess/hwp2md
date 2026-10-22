@@ -132,12 +132,15 @@ python hwp2md.py --batch "*.hwpx" -o converted
 | --- | --- | --- |
 | HWP 입력 감지 | 지원 | OLE Compound File signature와 HWP FileHeader를 확인합니다. |
 | HWPX 입력 감지 | 지원 | ZIP/XML 구조를 확인합니다. |
+| HWPML 입력 | 지원 | 한글 XML 형식(HWPML 2.x, `.hml`)과, 법제처 국가법령정보센터처럼 HWPML을 `.hwp` 확장자로 내려주는 파일을 본문·표·그림까지 변환합니다. |
 | 본문 텍스트 추출 | 지원 | HWP `BodyText/Section*`의 `PARA_TEXT` 레코드를 해석하고, inline 제어문자 때문에 빠지는 연도별 수치 등을 보정합니다. |
 | 제목/목록 추론 | 부분 지원 | `[1]`, `붙임1`, 짧은 `1. 제목`, `가. 제목` 등은 heading으로 승격합니다. |
 | 표 | 부분 지원 | HWP/HWPX 표를 복원합니다. 단순 표는 GFM, 병합 셀이 있는 표는 HTML fallback으로 출력합니다. |
 | 보도자료 metadata | 부분 지원 | 상단 보도자료 표의 배포일시, 보도일시, 담당부서, 담당자를 frontmatter와 report에 기록합니다. |
 | 이미지/첨부 추출 | 지원 | HWP `BinData/*`, HWPX `BinData/*`를 assets 폴더로 추출합니다. HWP BMP 이미지는 Markdown preview 호환성을 위해 PNG로 변환하고, 공백/괄호가 있는 경로는 안전한 Markdown 링크로 출력합니다. 캡션 뒤 그림 control을 감지하면 해당 위치에 우선 배치합니다. |
 | 배포용 문서 | 지원 | 복사·인쇄를 제한한 배포용 HWP는 `ViewText/Section*`의 본문을 풀어 변환하고 report에 `DISTRIBUTION_DOC_DECRYPTED` 경고를 남깁니다. 작성자가 정한 이용 범위 안에서 사용하세요. 암호를 건 문서는 지원하지 않습니다. |
+| 변경 추적 문서 | 지원 | 수정 내용을 반영한 최종본(`BodyText`)만 변환하고 삭제 표시된 글자는 넣지 않으며, report에 `TRACK_CHANGES_FINAL_TEXT` 경고를 남깁니다. |
+| 하이퍼링크/자동 번호 | 지원 | 웹·메일 하이퍼링크는 `[글자](주소)`로, 그림·표·수식 캡션의 자동 번호는 숫자로 채웁니다. 쪽 번호와 각주 번호는 Markdown에서 의미가 없어 넣지 않습니다. |
 | 각주/수식 | 부분 지원 | HWP/HWPX 수식 script(분수·근호·첨자·적분/합·LEFT/RIGHT 괄호·행렬/cases·그리스 문자·화살표 등)를 LaTeX로 옮깁니다. 문단 사이 수식은 `$$ $$`, 문장·표 칸 안 수식은 `\( \)`로 출력합니다. 각주는 placeholder로 보존하고 report에 기록합니다. |
 | 변환 리포트 | 지원 | 손실·경고·블록 수·자산 수를 JSON으로 생성합니다. |
 

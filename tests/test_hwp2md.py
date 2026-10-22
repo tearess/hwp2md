@@ -1,4 +1,6 @@
+import base64
 import struct
+import tempfile
 import unittest
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -205,6 +207,103 @@ class Hwp2MdUnitTests(unittest.TestCase):
     def test_distribution_view_text_without_key_record_is_rejected(self) -> None:
         with self.assertRaises(hwp2md.ConversionError):
             hwp2md.decrypt_hwp_view_text(b"\x00" * 300)
+
+    def test_hyperlink_url_from_hangul_command(self) -> None:
+        self.assertEqual(hwp2md.hyperlink_url(r"http\://www.pipc.go.kr;1;0;0;"), "http://www.pipc.go.kr")
+        self.assertEqual(hwp2md.hyperlink_url("www.onbid.co.kr;1;0;0;"), "http://www.onbid.co.kr")
+        self.assertEqual(hwp2md.hyperlink_url(r"mailto\:a@b.kr;1;0;0;"), "mailto:a@b.kr")
+        # 문서 안 책갈피로 가는 링크는 웹 주소가 아니므로 링크로 만들지 않는다.
+        self.assertEqual(hwp2md.hyperlink_url(r"\#AJAX;0;0;0;"), "")
+
+    def test_hwp_paragraph_hyperlink_becomes_markdown_link(self) -> None:
+        field_start = "\x03汫╨\x00\x00\x00\x00\x03"
+        field_end = "\x04汫\x68\x00\x00\x00\x00\x04"
+        text = ("▪위치: " + field_start + "www.pipc.go.kr" + field_end + " ⇨ 자료실\r").encode("utf-16le")
+        command = r"http\://www.pipc.go.kr;1;0;0;"
+        ctrl = b"klh%" + struct.pack("<IBH", 0, 0, len(command)) + command.encode("utf-16le")
+        records = [(hwp2md.HWP_PARA_TEXT_TAG, 1, text), (hwp2md.HWP_CTRL_HEADER_TAG, 1, ctrl)]
+
+        result = hwp2md.clean_hwp_text_payload(text, hwp2md.hwp_paragraph_controls(records, 0))
+
+        self.assertEqual(result, "▪위치: [www.pipc.go.kr](http://www.pipc.go.kr) ⇨ 자료실")
+
+    def test_hwp_caption_auto_number_is_filled(self) -> None:
+        auto_num = "\x12湯慴\x00\x00\x00\x00\x12"
+        text = ("[표 " + auto_num + "] 사업신탁과 주식회사의 비교\r").encode("utf-16le")
+        table_number = b"onta" + struct.pack("<IHHHH", 4, 5, 0, 0, 0)
+        page_number = b"onta" + struct.pack("<IHHHH", 0, 3, 0, 0, 0)
+        records = [(hwp2md.HWP_PARA_TEXT_TAG, 1, text), (hwp2md.HWP_CTRL_HEADER_TAG, 1, table_number)]
+
+        self.assertEqual(hwp2md.clean_hwp_text_payload(text, hwp2md.hwp_paragraph_controls(records, 0)), "[표 5] 사업신탁과 주식회사의 비교")
+        # 쪽 번호는 저장 당시 값이라 채우지 않는다.
+        self.assertEqual(hwp2md.parse_hwp_auto_number(page_number), "")
+
+    def test_header_row_ignores_link_url_length(self) -> None:
+        url = "http://www.ekiben.or.jp/mikado/new_releases/2023/06/002336.html"
+        self.assertTrue(hwp2md.looks_like_header_row([f"[鰤の小函すし]({url})", f"[[新発売]]({url})"]))
+
+    def test_format_auto_number_shapes(self) -> None:
+        self.assertEqual([hwp2md.format_auto_number(4, shape) for shape in range(6)], ["4", "④", "IV", "iv", "D", "d"])
+
+    def test_hwpx_field_parameters_are_not_body_text(self) -> None:
+        xml = (
+            '<hp:p xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"><hp:run>'
+            '<hp:ctrl><hp:fieldBegin id="1" type="CLICK_HERE"><hp:parameters><hp:integerParam name="Prop">9</hp:integerParam>'
+            '<hp:stringParam name="Command">본문을 입력하세요;</hp:stringParam></hp:parameters></hp:fieldBegin></hp:ctrl>'
+            '<hp:t>본문</hp:t><hp:ctrl><hp:fieldEnd beginIDRef="1"/></hp:ctrl><hp:t> 참고: </hp:t>'
+            '<hp:ctrl><hp:fieldBegin id="2" type="HYPERLINK"><hp:parameters><hp:integerParam name="Prop">0</hp:integerParam>'
+            '<hp:stringParam name="Command">https\\://www.law.go.kr;1;0;0;</hp:stringParam></hp:parameters></hp:fieldBegin></hp:ctrl>'
+            '<hp:t>법령정보</hp:t><hp:ctrl><hp:fieldEnd beginIDRef="2"/></hp:ctrl>'
+            '<hp:t> [표 </hp:t><hp:ctrl><hp:autoNum num="3" numType="TABLE"><hp:autoNumFormat type="DIGIT"/></hp:autoNum></hp:ctrl><hp:t>]</hp:t>'
+            "</hp:run></hp:p>"
+        )
+
+        self.assertEqual(hwp2md.collect_text(ET.fromstring(xml)), "본문 참고: [법령정보](https://www.law.go.kr) [표 3]")
+
+    def test_hwpml_document_is_detected_and_converted(self) -> None:
+        png = bytes.fromhex(
+            "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+            "1f15c4890000000d49444154789c6360000002000100e221bc330000000049454e44ae426082"
+        )
+        def cell(row: int, col: int, text: str, colspan: int = 1) -> str:
+            return (
+                f'<CELL ColAddr="{col}" RowAddr="{row}" ColSpan="{colspan}" RowSpan="1">'
+                f"<PARALIST><P><TEXT><CHAR>{text}</CHAR></TEXT></P></PARALIST></CELL>"
+            )
+
+        rows = [
+            cell(0, 0, "조문") + cell(0, 1, "신법") + cell(0, 2, "구법"),
+            cell(1, 0, "제1조") + cell(1, 1, "2019") + cell(1, 2, "2018"),
+            cell(2, 0, "제2조") + cell(2, 1, "개정", colspan=2),
+        ]
+        xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE HWPML [\n\t<!ENTITY nbsp\t"&#160;">\n]>\n'
+            '<HWPML Version="2.1"><HEAD SecCnt="1"><DOCSUMMARY><TITLE>제목 아님</TITLE></DOCSUMMARY>'
+            '<MAPPINGTABLE><BINDATALIST Count="1"><BINITEM Type="Embedding" BinData="1" Format="bmp"/></BINDATALIST></MAPPINGTABLE></HEAD>'
+            '<BODY><SECTION Id="0">\n{머리글}\n'
+            '<P><TEXT><CHAR>제1조(목적) 이 법은&nbsp;목적으로 한다.</CHAR></TEXT></P>'
+            '<P><TEXT><CHAR>[표 </CHAR><AUTONUM Number="2" NumberType="Table"><AUTONUMFORMAT Type="Digit"/></AUTONUM><CHAR>] 비교</CHAR></TEXT></P>'
+            '<P><TEXT><FIELDBEGIN Type="Hyperlink" InstId="7" Command="http\\://www.law.go.kr;1;0;0;"/><CHAR>국가법령정보센터</CHAR><FIELDEND Type="Hyperlink"/></TEXT></P>'
+            "<P><TEXT><TABLE>" + "".join(f"<ROW>{row}</ROW>" for row in rows) + "</TABLE></TEXT></P>"
+            "</SECTION></BODY>"
+            f'<TAIL><BINDATASTORAGE><BINDATA Id="1" Encoding="Base64">{base64.b64encode(png).decode()}</BINDATA></BINDATASTORAGE></TAIL></HWPML>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "법령.hwp"
+            source.write_text(xml, encoding="utf-8")
+            self.assertEqual(hwp2md.detect_format(source), "hwpml")
+
+            result = hwp2md.convert_file(source, Path(tmp) / "out.md", None, None, hwp2md.ConvertOptions())
+
+        self.assertEqual(result.report["format"], "hwpml")
+        self.assertIn("제1조(목적) 이 법은 목적으로 한다.", result.markdown)
+        self.assertIn("[표 2] 비교", result.markdown)
+        self.assertIn("[국가법령정보센터](http://www.law.go.kr)", result.markdown)
+        self.assertNotIn("{머리글}", result.markdown)
+        self.assertNotIn("제목 아님", result.markdown)
+        table = next(block for block in result.blocks if block.type == "table")
+        self.assertEqual([(c.row, c.col, c.colspan, c.text) for c in table.cells][-2:], [(2, 0, 1, "제2조"), (2, 1, 2, "개정")])
+        self.assertEqual([(asset.output, asset.width) for asset in result.assets], [("image-001.png", 1)])
 
     def test_caption_following_image_anchor_prevents_duplicate_caption_insert(self) -> None:
         blocks = [

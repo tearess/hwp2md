@@ -8,6 +8,8 @@ hwp2md: HWP/HWPX to Markdown converter
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import dataclasses
 import fnmatch
 import html
@@ -160,6 +162,11 @@ def detect_format(path: Path) -> str:
         return "hwp"
     if zipfile.is_zipfile(path):
         return "hwpx"
+    if head.lstrip(HWP_TEXT_LEAD_BYTES).startswith(b"<"):
+        # 법제처 등에서 내려받는 .hwp 중에는 한글 XML 형식(HWPML)으로 저장된 파일이 많다.
+        with path.open("rb") as f:
+            if b"<HWPML" in f.read(4096):
+                return "hwpml"
     reason = unsupported_format_reason(head)
     if reason:
         raise ConversionError(reason)
@@ -167,6 +174,8 @@ def detect_format(path: Path) -> str:
         return "hwp"
     if suffix == ".hwpx":
         return "hwpx"
+    if suffix == ".hml":
+        return "hwpml"
     raise ConversionError(f"지원하지 않는 파일 형식입니다: {path}")
 
 
@@ -222,7 +231,106 @@ def clean_plain_text(text: str) -> str:
 HWP_EXTENDED_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x17]")
 
 
-def clean_hwp_text_payload(payload: bytes) -> str:
+# 하이퍼링크 위치를 글자 정리 과정 동안 보존하는 표식. 유니코드 비문자라 본문 글자와 겹치지 않는다.
+LINK_OPEN, LINK_SEP, LINK_CLOSE, LINK_CLOSE_END = "﷐", "﷑", "﷒", "﷓"
+LINK_MARK_RE = re.compile("﷐(\\d+)﷑([^﷑]*)﷑(.*?)﷒\\1﷓", re.S)
+LINK_LEFTOVER_RE = re.compile("﷐\\d*﷑[^﷑]*﷑|﷒\\d*﷓|[﷐-﷓]")
+HWP_HYPERLINK_CTRL_ID = b"klh%"
+
+
+def link_open_mark(link_id: str, url: str) -> str:
+    return f"{LINK_OPEN}{link_id}{LINK_SEP}{url}{LINK_SEP}"
+
+
+def link_close_mark(link_id: str) -> str:
+    return f"{LINK_CLOSE}{link_id}{LINK_CLOSE_END}"
+
+
+def finalize_link_marks(text: str) -> str:
+    """짝이 맞는 링크 표식을 [글자](주소)로 바꾸고 짝 없는 표식은 지운다."""
+    if LINK_OPEN not in text and LINK_CLOSE not in text:
+        return text
+
+    def to_link(match: re.Match[str]) -> str:
+        url, label = match.group(2), finalize_link_marks(match.group(3))
+        label = re.sub(r"\s*\n\s*", " ", label)
+        return f"[{label}]({url})" if url and label.strip() else label
+
+    return LINK_LEFTOVER_RE.sub("", LINK_MARK_RE.sub(to_link, text))
+
+
+def hyperlink_url(command: str) -> str:
+    """한글 하이퍼링크 명령("주소;종류;...;", 역슬래시 이스케이프)에서 웹 주소만 꺼낸다. 문서 안 책갈피 등은 빈 문자열."""
+    match = re.match(r"(?:\\.|[^;\\])*", command)
+    target = re.sub(r"\\(.)", r"\1", match.group(0) if match else "").strip()
+    if not re.match(r"(?i)(?:https?|ftp|mailto):|www\.", target):
+        return ""
+    if target.lower().startswith("www."):
+        target = "http://" + target
+    return target.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+
+def parse_hwp_hyperlink_command(payload: bytes) -> str:
+    # 필드 컨트롤: id(4) 속성(4) 기타 속성(1) 명령 글자 수(WORD) 명령(WCHAR)
+    if len(payload) < 11:
+        return ""
+    length = struct.unpack_from("<H", payload, 9)[0]
+    return payload[11 : 11 + 2 * length].decode("utf-16le", errors="ignore")
+
+
+HWP_AUTO_NUMBER_CTRL_ID = b"onta"
+# 자동 번호 중 그림·표·수식 캡션 번호만 본문에 채운다. 쪽 번호는 저장 당시 값일 뿐이고 각주 번호는 Markdown이 다시 매긴다.
+CAPTION_NUMBER_TYPES = {"PICTURE", "FIGURE", "TABLE", "EQUATION"}
+HWP_AUTO_NUMBER_TYPES = {3: "PICTURE", 4: "TABLE", 5: "EQUATION"}
+AUTO_NUMBER_SHAPES = {"DIGIT": 0, "CIRCLEDDIGIT": 1, "ROMANCAPITAL": 2, "ROMANSMALL": 3, "LATINCAPITAL": 4, "LATINSMALL": 5}
+
+
+def format_auto_number(number: int, shape: int) -> str:
+    if shape == 1 and 1 <= number <= 20:
+        return chr(0x2460 + number - 1)
+    if shape in (2, 3) and 0 < number < 4000:
+        roman = ""
+        for value, letters in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+            count, number = divmod(number, value)
+            roman += letters * count
+        return roman if shape == 2 else roman.lower()
+    if shape in (4, 5) and 1 <= number <= 26:
+        return chr((0x41 if shape == 4 else 0x61) + number - 1)
+    return str(number)
+
+
+def parse_hwp_auto_number(payload: bytes) -> str:
+    # 자동 번호 컨트롤: id(4) 속성(UINT32: 0~3비트 종류, 4~11비트 모양) 번호(WORD) 사용자 기호·앞 장식·뒤 장식(WCHAR)
+    if len(payload) < 10:
+        return ""
+    prop, number = struct.unpack_from("<IH", payload, 4)
+    if HWP_AUTO_NUMBER_TYPES.get(prop & 0x0F) is None:
+        return ""
+    prefix, suffix = struct.unpack_from("<HH", payload, 12) if len(payload) >= 16 else (0, 0)
+    decorate = lambda code: chr(code) if code >= 32 else ""  # noqa: E731
+    return f"{decorate(prefix)}{format_auto_number(number, (prop >> 4) & 0xFF)}{decorate(suffix)}"
+
+
+def hwp_paragraph_controls(records: list[tuple[int, int, bytes]], text_idx: int) -> Optional[dict[bytes, list[str]]]:
+    """PARA_TEXT 뒤에 나오는 같은 문단의 하이퍼링크 주소와 자동 번호를 순서대로 모은다."""
+    payload = records[text_idx][2]
+    if HWP_HYPERLINK_CTRL_ID not in payload and HWP_AUTO_NUMBER_CTRL_ID not in payload:
+        return None
+    text_level = records[text_idx][1]
+    controls: dict[bytes, list[str]] = {HWP_HYPERLINK_CTRL_ID: [], HWP_AUTO_NUMBER_CTRL_ID: []}
+    for tag, level, ctrl_payload in records[text_idx + 1 :]:
+        if level < text_level:
+            break
+        if level != text_level or tag != HWP_CTRL_HEADER_TAG:
+            continue
+        if ctrl_payload[:4] == HWP_HYPERLINK_CTRL_ID:
+            controls[HWP_HYPERLINK_CTRL_ID].append(hyperlink_url(parse_hwp_hyperlink_command(ctrl_payload)))
+        elif ctrl_payload[:4] == HWP_AUTO_NUMBER_CTRL_ID:
+            controls[HWP_AUTO_NUMBER_CTRL_ID].append(parse_hwp_auto_number(ctrl_payload))
+    return controls
+
+
+def clean_hwp_text_payload(payload: bytes, controls: Optional[dict[bytes, list[str]]] = None) -> str:
     """HWP PARA_TEXT 레코드에서 사람이 읽을 수 있는 문자열을 최대한 보수적으로 추출한다.
 
     HWP 바이너리 텍스트에는 문단/표/그림/필드 제어 문자가 UTF-16 코드 단위 사이에
@@ -237,15 +345,34 @@ def clean_hwp_text_payload(payload: bytes) -> str:
     visible = clean_hwp_decoded_text(s, skip_extended_controls=False)
     if should_use_visible_hwp_text(structured, visible):
         return visible
+    if controls:
+        return clean_hwp_decoded_text(s, skip_extended_controls=True, controls=controls)
     return structured
 
 
-def clean_hwp_decoded_text(s: str, skip_extended_controls: bool) -> str:
+def clean_hwp_decoded_text(s: str, skip_extended_controls: bool, controls: Optional[dict[bytes, list[str]]] = None) -> str:
     out: list[str] = []
+    links = controls.get(HWP_HYPERLINK_CTRL_ID) if controls else None
+    pending_links = iter(links or [])
+    pending_numbers = iter(controls.get(HWP_AUTO_NUMBER_CTRL_ID) or []) if controls else iter(())
+    # 필드 시작(3)과 끝(4)은 짝을 이루며 중첩될 수 있다. 하이퍼링크 필드만 링크 번호를 기억한다.
+    open_fields: list[Optional[str]] = []
     i = 0
     while i < len(s):
         ch = s[i]
         code = ord(ch)
+        if controls and code == 18 and s[i + 1 : i + 3] == "湯慴":  # 자동 번호 컨트롤 ID "atno"
+            out.append(next(pending_numbers, ""))
+        if links is not None and code == 3:
+            is_link = s[i + 1 : i + 3] == "汫╨"  # 컨트롤 ID "%hlk"
+            url = next(pending_links, "") if is_link else ""
+            open_fields.append(str(i) if url else None)
+            if url:
+                out.append(link_open_mark(str(i), url))
+        elif links is not None and code == 4 and open_fields:
+            link_id = open_fields.pop()
+            if link_id is not None:
+                out.append(link_close_mark(link_id))
         if ch in "\r\n\t":
             out.append("\n" if ch in "\r\n" else "\t")
             # 탭(9)은 인라인 컨트롤이라 [9, 너비, ..., 9] 총 8유닛이다. 뒤 7유닛은 글자가 아니므로 건너뛴다.
@@ -282,7 +409,7 @@ def clean_hwp_decoded_text(s: str, skip_extended_controls: bool) -> str:
     text = "".join(out).translate(HWP_SYMBOL_FONT_MAP)
     # HWP 내부 객체 anchor가 남긴 짧은 영문 토큰 제거.
     text = re.sub(r"\b(?:dces|lcol|hdpg|pnpg|onwn|tcpg| lbt|dahe)\b", "", text)
-    return clean_plain_text(text)
+    return finalize_link_marks(clean_plain_text(text))
 
 
 def should_use_visible_hwp_text(structured: str, visible: str) -> bool:
@@ -410,12 +537,12 @@ def parse_hwp_table_records(
             if addition:
                 current_cell.text = "\n".join(part for part in [current_cell.text, addition] if part)
         elif current_cell is not None and rec_tag == HWP_PARA_TEXT_TAG and rec_level > table_level + 1:
-            text = clean_hwp_text_payload(rec_payload)
+            text = clean_hwp_text_payload(rec_payload, hwp_paragraph_controls(records, idx))
             if text:
                 current_cell.text = "\n".join(part for part in [current_cell.text, text] if part)
         elif current_cell is None and not saw_table_record and rec_tag == HWP_PARA_TEXT_TAG and rec_level > table_level + 1:
             # TABLE 레코드보다 앞서 나오는 문단 리스트는 표 캡션이다. 셀이 아니므로 따로 모았다가 표 앞에 낸다.
-            caption = clean_hwp_text_payload(rec_payload)
+            caption = clean_hwp_text_payload(rec_payload, hwp_paragraph_controls(records, idx))
             if caption:
                 caption_lines.append(caption)
 
@@ -1554,6 +1681,9 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
         body_storage = "ViewText" if distributed else "BodyText"
         if distributed:
             warnings.append(WarningItem("DISTRIBUTION_DOC_DECRYPTED", "배포용 문서(복사·인쇄 제한)의 본문을 풀어 변환했습니다. 작성자가 정한 이용 범위 안에서 사용하세요."))
+        elif flags & 0x4000:
+            # 변경 추적 문서는 BodyText에 최종본을, ViewText에 삭제 표시까지 담은 수정 표시본을 둔다.
+            warnings.append(WarningItem("TRACK_CHANGES_FINAL_TEXT", "변경 추적 문서입니다. 수정 내용을 반영한 최종본만 변환했고 삭제 표시된 글자는 넣지 않았습니다."))
 
         sections = [s for s in ole.listdir(streams=True, storages=False) if len(s) == 2 and s[0] == body_storage and s[1].lower().startswith("section")]
         sections.sort(key=lambda s: int(re.sub(r"\D+", "", s[1]) or "0"))
@@ -1632,7 +1762,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                         continue
                 if tag_id == HWP_PARA_TEXT_TAG:
                     para_count += 1
-                    text = clean_hwp_text_payload(payload)
+                    text = clean_hwp_text_payload(payload, hwp_paragraph_controls(records, idx))
                     for part in split_text_to_candidate_blocks(text):
                         append_text_block(blocks, part, options.heading_policy, is_first=not has_content_blocks(blocks), include_page_artifacts=options.include_page_artifacts)
                 idx += 1
@@ -1926,6 +2056,119 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
     return ConvertResult(markdown=markdown, report=report, blocks=blocks, assets=assets)
 
 
+HWPML_TAG_MAP = {
+    "P": "p", "TABLE": "tbl", "ROW": "tr", "CELL": "tc", "CAPTION": "caption", "LINEBREAK": "lineBreak",
+    "TAB": "tab", "EQUATION": "equation", "SCRIPT": "script",
+}
+
+
+def hwpml_to_hwpx_tree(elem: ET.Element, open_fields: Optional[list[str]] = None) -> ET.Element:
+    """HWPML(한글 XML) 본문을 HWPX와 같은 이름의 트리로 옮겨 HWPX 변환 경로를 그대로 쓰게 한다."""
+    if open_fields is None:
+        open_fields = []
+    if elem.tag == "FIELDBEGIN":
+        # HWPML 필드 끝에는 짝 정보가 없어 문서 순서대로 쌓아 두었다가 이어 준다.
+        field_id = elem.get("InstId") or str(len(open_fields))
+        open_fields.append(field_id)
+        node = ET.Element("fieldBegin", {"type": (elem.get("Type") or "").upper(), "id": field_id})
+        if elem.get("Command"):
+            ET.SubElement(node, "stringParam", {"name": "Command"}).text = elem.get("Command")
+        return node
+    if elem.tag == "FIELDEND":
+        return ET.Element("fieldEnd", {"beginIDRef": open_fields.pop() if open_fields else ""})
+    if elem.tag == "AUTONUM":
+        node = ET.Element("autoNum", {"num": elem.get("Number", ""), "numType": (elem.get("NumberType") or "").upper()})
+        fmt = elem.find("AUTONUMFORMAT")
+        if fmt is not None:
+            ET.SubElement(node, "autoNumFormat", {
+                "type": fmt.get("Type", ""), "prefixChar": fmt.get("PrefixChar", ""), "suffixChar": fmt.get("SuffixChar", ""),
+            })
+        return node
+    node = ET.Element(HWPML_TAG_MAP.get(elem.tag, elem.tag), dict(elem.attrib))
+    # 문단 밖 SECTION 등에 들어 있는 서식 자리표시자({머리글} 등)는 본문이 아니므로 CHAR·SCRIPT 글자만 옮긴다.
+    if elem.tag in {"CHAR", "SCRIPT"}:
+        node.text = elem.text
+    for child in elem:
+        node.append(hwpml_to_hwpx_tree(child, open_fields))
+        if elem.tag == "CHAR":
+            node[-1].tail = child.tail
+    if elem.tag == "CELL":
+        ET.SubElement(node, "cellAddr", {"colAddr": elem.get("ColAddr", "0"), "rowAddr": elem.get("RowAddr", "0")})
+        ET.SubElement(node, "cellSpan", {"colSpan": elem.get("ColSpan", "1"), "rowSpan": elem.get("RowSpan", "1")})
+    return node
+
+
+def convert_hwpml(input_path: Path, output_path: Path, assets_dir: Path, options: ConvertOptions) -> ConvertResult:
+    warnings: list[WarningItem] = []
+    losses: list[LossItem] = []
+    blocks: list[Block] = []
+    assets: list[Asset] = []
+
+    if input_path.stat().st_size > MAX_SECTION_BYTES + MAX_TOTAL_ASSET_BYTES:
+        raise ConversionError(f"HWPML 파일이 너무 큽니다 (한도 {format_megabytes(MAX_SECTION_BYTES + MAX_TOTAL_ASSET_BYTES)}).")
+    try:
+        root = ET.parse(input_path).getroot()
+    except ET.ParseError as exc:
+        raise ConversionError(f"HWPML XML을 읽을 수 없습니다 ({exc}).") from exc
+    body = root.find("BODY")
+    if body is None:
+        raise ConversionError("HWPML BODY 요소를 찾을 수 없습니다.")
+    walk_hwpx_blocks(hwpml_to_hwpx_tree(body), blocks, options.heading_policy, options.include_page_artifacts)
+
+    if options.image_mode != "skip":
+        # 그림은 TAIL/BINDATASTORAGE에 base64로 들어 있다. 적힌 Format이 실제와 다를 수 있어 내용으로 판별한다.
+        formats = {item.get("BinData"): item.get("Format", "") for item in root.iter("BINITEM")}
+        bin_items = [b for b in root.iter("BINDATA") if (b.text or "").strip()]
+        if bin_items:
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            if options.clean_assets:
+                removed = clean_generated_assets(assets_dir, safe_stem(input_path))
+                if removed:
+                    warnings.append(WarningItem("ASSETS_CLEANED", f"이전 변환에서 생성된 자산 {removed}개를 정리했습니다."))
+        total_bytes = 0
+        for idx, item in enumerate(bin_items, start=1):
+            source = f"BINDATA/{item.get('Id', idx)}"
+            try:
+                data = base64.b64decode(item.text or "", validate=False)
+            except (ValueError, binascii.Error) as exc:
+                warnings.append(WarningItem("ASSET_SKIPPED", f"{source}: base64 해석 실패 ({exc})", source))
+                continue
+            if guess_extension(data) == ".bin":
+                try:
+                    data = bounded_zlib_decompress(data, -15, MAX_ASSET_BYTES)
+                except (zlib.error, DecompressLimitError):
+                    pass
+            if len(data) > MAX_ASSET_BYTES or total_bytes + len(data) > MAX_TOTAL_ASSET_BYTES:
+                warnings.append(WarningItem("ASSET_SKIPPED", f"{source}: 그림 크기가 한도를 넘습니다", source))
+                continue
+            total_bytes += len(data)
+            ext = guess_extension(data)
+            if ext == ".bin" and formats.get(item.get("Id")):
+                ext = "." + formats[item.get("Id")].lower()
+            if ext == ".bmp":
+                png_data = bmp_to_png(data)
+                if png_data:
+                    data = png_data
+                    ext = ".png"
+            out_name = generated_asset_name(idx, ext)
+            (assets_dir / out_name).write_bytes(data)
+            width, height = image_dimensions_from_bytes(data)
+            index = int(item.get("Id")) if (item.get("Id") or "").isdigit() else None
+            assets.append(Asset(source=source, output=out_name, kind="image", bytes=len(data), index=index, width=width, height=height))
+        if bin_items:
+            write_asset_manifest(assets_dir, assets)
+        if assets:
+            warnings.append(WarningItem("ASSET_POSITION_APPROXIMATED", "HWPML 이미지의 본문 내 배치 위치를 해석하지 못해 첨부 목록으로 보존합니다."))
+
+    if not blocks:
+        warnings.append(WarningItem("NO_TEXT_BLOCKS", "추출된 텍스트 블록이 없습니다."))
+    losses.append(LossItem("LAYOUT_DROPPED", 1))
+    losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
+    report = build_report(input_path, "hwpml", blocks, assets, warnings, losses)
+    markdown = render_markdown(input_path, blocks, assets, report, options, output_path, assets_dir)
+    return ConvertResult(markdown=markdown, report=report, blocks=blocks, assets=assets)
+
+
 def is_encrypted_hwpx(zf: zipfile.ZipFile, names: list[str]) -> bool:
     # 암호를 건 HWPX는 META-INF/manifest.xml의 항목마다 ODF 방식의 encryption-data를 적는다.
     manifest = next((n for n in names if n.lower() == "meta-inf/manifest.xml"), None)
@@ -1944,7 +2187,7 @@ def local_name(elem: ET.Element) -> str:
 
 def collect_text(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
     # HWPX도 HWP와 같이 Wingdings/Symbol 글꼴 기호를 사용자 정의 영역 글자로 저장한다.
-    return clean_plain_text(collect_text_with_inline_styles(elem, skip).translate(HWP_SYMBOL_FONT_MAP))
+    return finalize_link_marks(clean_plain_text(collect_text_with_inline_styles(elem, skip).translate(HWP_SYMBOL_FONT_MAP)))
 
 
 def collect_text_with_inline_styles(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
@@ -1957,6 +2200,24 @@ def collect_text_with_inline_styles(elem: ET.Element, skip: Optional[set[int]] =
         # 수식은 <hp:script>의 한글 수식 스크립트만 LaTeX로 옮기고 설명문(shapeComment) 등은 넣지 않는다.
         script = next((child.text for child in elem.iter() if local_name(child) == "script"), None) or ""
         return rf"\({hwp_equation_to_latex(script)}\)" if script.strip() else ""
+    if name == "fieldBegin":
+        # 필드 매개변수(명령 문자열, 메모 정보 등)는 본문이 아니다. 하이퍼링크만 링크 표식을 남긴다.
+        if (elem.get("type") or "").upper() == "HYPERLINK":
+            command = next((p.text or "" for p in elem.iter() if local_name(p) == "stringParam" and p.get("name") == "Command"), "")
+            url = hyperlink_url(command)
+            if url:
+                return link_open_mark(re.sub(r"\D", "", elem.get("id") or "") or "0", url)
+        return ""
+    if name == "fieldEnd":
+        return link_close_mark(re.sub(r"\D", "", elem.get("beginIDRef") or "") or "0")
+    if name == "autoNum":
+        if (elem.get("numType") or "").upper() not in CAPTION_NUMBER_TYPES or not (elem.get("num") or "").isdigit():
+            return ""
+        fmt = next((child for child in elem if local_name(child) == "autoNumFormat"), None)
+        shape = AUTO_NUMBER_SHAPES.get(re.sub(r"[^A-Z]", "", (fmt.get("type") or "").upper()), 0) if fmt is not None else 0
+        prefix = fmt.get("prefixChar", "") if fmt is not None else ""
+        suffix = fmt.get("suffixChar", "") if fmt is not None else ""
+        return f"{prefix}{format_auto_number(int(elem.get('num')), shape)}{suffix}"
     parts: list[str] = []
     if elem.text:
         parts.append(elem.text)
@@ -2382,7 +2643,8 @@ def drop_empty_table_columns(rows: list[list[str]]) -> list[list[str]]:
 
 
 def looks_like_header_row(row: list[str]) -> bool:
-    non_empty = [cell.strip() for cell in row if cell.strip()]
+    # 링크는 화면에 보이는 글자만 센다. 주소 길이 때문에 머리행이 본문으로 밀리지 않게 한다.
+    non_empty = [re.sub(r"\[((?:[^\[\]]|\[[^\]]*\])*)\]\([^)\s]*\)", r"\1", cell).strip() for cell in row if cell.strip()]
     if not non_empty:
         return False
     marker_pattern = r"^(?:[-*+]|[•·∙◦ㆍ□○■▶▷◇◆※]|\(?\d{1,4}\)?[.)]|\d{4}\.\d{1,2}\.\d{1,2})"
@@ -2457,6 +2719,8 @@ def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path]
             result = convert_hwp(input_path, output_path, assets_dir, options)
         elif fmt == "hwpx":
             result = convert_hwpx(input_path, output_path, assets_dir, options)
+        elif fmt == "hwpml":
+            result = convert_hwpml(input_path, output_path, assets_dir, options)
         else:
             raise ConversionError(f"지원하지 않는 파일 형식입니다: {fmt}")
     except ConversionError:
@@ -2506,7 +2770,7 @@ def unique_path(path: Path) -> Path:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="HWP/HWPX 문서를 Markdown과 assets/report 파일로 변환합니다.")
-    parser.add_argument("input", nargs="?", help="입력 .hwp 또는 .hwpx 파일")
+    parser.add_argument("input", nargs="?", help="입력 .hwp, .hwpx 또는 .hml(HWPML) 파일")
     parser.add_argument("-o", "--output", help="출력 Markdown 경로")
     parser.add_argument("--assets-dir", help="이미지/첨부 자산 폴더")
     parser.add_argument("--format", choices=["gfm", "commonmark", "obsidian"], default="gfm", help="Markdown 출력 방언")
