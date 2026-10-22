@@ -184,10 +184,16 @@ def source_stem(path: Path) -> str:
     return stem or safe_stem(path)
 
 
+INLINE_MATH_RE = re.compile(r"(\\\(.*?\\\))", re.S)
+
+
 def escape_md_text(text: str) -> str:
     # 문장 내부의 과도한 이스케이프는 가독성을 해치므로 Markdown 구조 문자 일부만 보수적으로 처리한다.
-    text = text.replace("\\", "\\\\")
-    text = re.sub(r"([*_`])", r"\\\1", text)
+    # 수식(\( ... \))은 LaTeX 그대로 두어야 하므로 이스케이프하지 않는다.
+    pieces = INLINE_MATH_RE.split(text)
+    for idx in range(0, len(pieces), 2):
+        pieces[idx] = re.sub(r"([*_`])", r"\\\1", pieces[idx].replace("\\", "\\\\"))
+    text = "".join(pieces)
     # 줄 맨 앞의 '#', '>'는 제목/인용으로 해석되므로 이스케이프한다.
     text = re.sub(r"^(\s*)([#>])", r"\1\\\2", text)
     return text
@@ -730,8 +736,10 @@ def read_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> b
     return data
 
 
-def read_hwp_stream(ole: Any, stream: list[str] | str, compressed: bool) -> bytes:
+def read_hwp_stream(ole: Any, stream: list[str] | str, compressed: bool, distributed: bool = False) -> bytes:
     data = ole.openstream(stream).read()
+    if distributed:
+        data = decrypt_hwp_view_text(data)
     if compressed:
         try:
             return bounded_zlib_decompress(data, -15, MAX_SECTION_BYTES)
@@ -740,6 +748,139 @@ def read_hwp_stream(ole: Any, stream: list[str] | str, compressed: bool) -> byte
         except zlib.error:
             return bounded_zlib_decompress(data, 15, MAX_SECTION_BYTES)
     return data
+
+
+HWP_DISTRIBUTE_DOC_DATA_TAG = 28
+
+
+def decrypt_hwp_view_text(data: bytes) -> bytes:
+    """배포용 문서의 ViewText/Section 스트림을 AES-128(ECB)로 풀어 BodyText와 같은 형태로 돌려준다.
+
+    스트림 맨 앞의 DISTRIBUTE_DOC_DATA 레코드(256바이트)에 복호화 키가 섞여 들어 있다.
+    """
+    if len(data) < 4 + 256:
+        raise ConversionError("배포용 문서의 ViewText 스트림이 너무 짧습니다.")
+    header = struct.unpack_from("<I", data, 0)[0]
+    if header & 0x3FF != HWP_DISTRIBUTE_DOC_DATA_TAG or (header >> 20) & 0xFFF != 256:
+        raise ConversionError("배포용 문서의 복호화 정보(DISTRIBUTE_DOC_DATA)를 찾을 수 없습니다.")
+    key = hwp_distribution_key(data[4 : 4 + 256])
+    body = data[4 + 256 :]
+    return aes128_ecb_decrypt(key, body[: len(body) - len(body) % 16])
+
+
+def hwp_distribution_key(payload: bytes) -> bytes:
+    # 앞 4바이트를 씨앗으로 MSVC rand()를 돌려 나온 값으로 나머지를 XOR하면 키가 드러난다.
+    seed = struct.unpack_from("<I", payload, 0)[0]
+    data = bytearray(payload)
+    state = seed
+    value = count = 0
+    for i in range(256):
+        if count == 0:
+            state = (state * 214013 + 2531011) & 0xFFFFFFFF
+            value = (state >> 16) & 0xFF
+            state = (state * 214013 + 2531011) & 0xFFFFFFFF
+            count = ((state >> 16) & 0x0F) + 1
+        if i >= 4:
+            data[i] ^= value
+        count -= 1
+    offset = 4 + (seed & 0x0F)
+    return bytes(data[offset : offset + 16])
+
+
+_AES_TABLES: Optional[tuple[list[int], list[int], list[list[int]]]] = None
+
+
+def aes_tables() -> tuple[list[int], list[int], list[list[int]]]:
+    """S-box, 역 S-box, 복호화용 T-table 4개를 처음 쓸 때 한 번만 계산한다."""
+    global _AES_TABLES
+    if _AES_TABLES is not None:
+        return _AES_TABLES
+
+    def gmul(a: int, b: int) -> int:
+        out = 0
+        while b:
+            if b & 1:
+                out ^= a
+            a = ((a << 1) ^ 0x11B) if a & 0x80 else a << 1
+            b >>= 1
+        return out
+
+    def rotl8(x: int, shift: int) -> int:
+        return ((x << shift) | (x >> (8 - shift))) & 0xFF
+
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        sbox[p] = q ^ rotl8(q, 1) ^ rotl8(q, 2) ^ rotl8(q, 3) ^ rotl8(q, 4) ^ 0x63
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    inv_sbox = [0] * 256
+    for i, s in enumerate(sbox):
+        inv_sbox[s] = i
+    td0 = [(gmul(s, 14) << 24) | (gmul(s, 9) << 16) | (gmul(s, 13) << 8) | gmul(s, 11) for s in inv_sbox]
+    tds = [td0]
+    for shift in (8, 16, 24):
+        tds.append([((x >> shift) | (x << (32 - shift))) & 0xFFFFFFFF for x in td0])
+    _AES_TABLES = (sbox, inv_sbox, tds)
+    return _AES_TABLES
+
+
+def aes128_decrypt_round_keys(key: bytes) -> list[int]:
+    sbox, _inv_sbox, (td0, td1, td2, td3) = aes_tables()
+    words = list(struct.unpack(">4I", key))
+    rcon = 1
+    for i in range(4, 44):
+        t = words[i - 1]
+        if i % 4 == 0:
+            t = ((t << 8) | (t >> 24)) & 0xFFFFFFFF
+            t = (sbox[t >> 24] << 24) | (sbox[(t >> 16) & 0xFF] << 16) | (sbox[(t >> 8) & 0xFF] << 8) | sbox[t & 0xFF]
+            t ^= rcon << 24
+            rcon = ((rcon << 1) ^ 0x11B) if rcon & 0x80 else rcon << 1
+        words.append(words[i - 4] ^ t)
+    # 복호화는 라운드 키를 거꾸로 쓰고, 처음과 마지막을 뺀 라운드 키에는 InvMixColumns를 미리 적용한다.
+    round_keys: list[int] = []
+    for rnd in range(10, -1, -1):
+        for w in words[rnd * 4 : rnd * 4 + 4]:
+            if 0 < rnd < 10:
+                w = td0[sbox[w >> 24]] ^ td1[sbox[(w >> 16) & 0xFF]] ^ td2[sbox[(w >> 8) & 0xFF]] ^ td3[sbox[w & 0xFF]]
+            round_keys.append(w)
+    return round_keys
+
+
+def aes128_ecb_decrypt(key: bytes, data: bytes) -> bytes:
+    _sbox, si, (td0, td1, td2, td3) = aes_tables()
+    rk = aes128_decrypt_round_keys(key)
+    out = bytearray(len(data))
+    for pos in range(0, len(data), 16):
+        s0, s1, s2, s3 = struct.unpack_from(">4I", data, pos)
+        s0 ^= rk[0]
+        s1 ^= rk[1]
+        s2 ^= rk[2]
+        s3 ^= rk[3]
+        for r in range(4, 40, 4):
+            t0 = td0[s0 >> 24] ^ td1[(s3 >> 16) & 0xFF] ^ td2[(s2 >> 8) & 0xFF] ^ td3[s1 & 0xFF] ^ rk[r]
+            t1 = td0[s1 >> 24] ^ td1[(s0 >> 16) & 0xFF] ^ td2[(s3 >> 8) & 0xFF] ^ td3[s2 & 0xFF] ^ rk[r + 1]
+            t2 = td0[s2 >> 24] ^ td1[(s1 >> 16) & 0xFF] ^ td2[(s0 >> 8) & 0xFF] ^ td3[s3 & 0xFF] ^ rk[r + 2]
+            t3 = td0[s3 >> 24] ^ td1[(s2 >> 16) & 0xFF] ^ td2[(s1 >> 8) & 0xFF] ^ td3[s0 & 0xFF] ^ rk[r + 3]
+            s0, s1, s2, s3 = t0, t1, t2, t3
+        struct.pack_into(
+            ">4I",
+            out,
+            pos,
+            ((si[s0 >> 24] << 24) | (si[(s3 >> 16) & 0xFF] << 16) | (si[(s2 >> 8) & 0xFF] << 8) | si[s1 & 0xFF]) ^ rk[40],
+            ((si[s1 >> 24] << 24) | (si[(s0 >> 16) & 0xFF] << 16) | (si[(s3 >> 8) & 0xFF] << 8) | si[s2 & 0xFF]) ^ rk[41],
+            ((si[s2 >> 24] << 24) | (si[(s1 >> 16) & 0xFF] << 16) | (si[(s0 >> 8) & 0xFF] << 8) | si[s3 & 0xFF]) ^ rk[42],
+            ((si[s3 >> 24] << 24) | (si[(s2 >> 16) & 0xFF] << 16) | (si[(s1 >> 8) & 0xFF] << 8) | si[s0 & 0xFF]) ^ rk[43],
+        )
+    return bytes(out)
 
 
 def import_olefile() -> Any:
@@ -999,29 +1140,255 @@ def extract_hwp_equation(records: list[tuple[int, int, bytes]], start_idx: int) 
 
 
 def normalize_hwp_equation(payload: bytes) -> Optional[str]:
-    text = payload.decode("utf-16le", errors="ignore")
-    text = text.split("HYhwpEQ", 1)[0]
-    text = re.sub(r"[\x00-\x1f]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"^[^\w가-힣+\-(){}\[\]^.]+", "", text)
-    text = re.sub(r"[^\w가-힣+\-*/=().,{}\[\]^_ %]+$", "", text)
-    if not text:
+    script = hwp_equation_script(payload)
+    if script is None:
+        # 글자 수가 깨졌으면 머리(6바이트) 뒤부터 첫 NUL(글자 크기 필드) 앞까지를 스크립트로 보고 끝의 잡문자를 걷어낸다.
+        script = payload[6:].decode("utf-16le", errors="ignore").split("\x00", 1)[0]
+        script = re.split(r"HYhwpEQ|HancomEQN|Equation Version", script, maxsplit=1)[0]
+        script = re.sub(r"[\x00-\x1f]+", " ", script)
+        script = re.sub(r"[^0-9A-Za-z가-힣+\-*/=().,{}\[\]^_ %`~#&<>!|]+$", "", script).strip()
+    if not script.strip():
         return None
-    return hwp_equation_to_latex(text)
+    return hwp_equation_to_latex(script)
 
 
-def hwp_equation_to_latex(text: str) -> str:
-    text = text.strip()
-    simple_fraction = re.search(r"\{?\s*([0-9.]+)\s*\}?\s*over\s*\{?\s*([0-9.]+)\s*\}?", text, flags=re.I)
-    if simple_fraction:
-        return f"\\frac{{{simple_fraction.group(1)}}}{{{simple_fraction.group(2)}}}"
-    fraction = re.fullmatch(r"(.+?)\s*over\s*(.+)", text, flags=re.I)
-    if fraction:
-        return f"\\frac{{{fraction.group(1).strip()}}}{{{fraction.group(2).strip()}}}"
-    text = re.sub(r"\bover\b", r"\\over ", text, flags=re.I)
-    text = re.sub(r"\btimes\b", r"\\times ", text, flags=re.I)
-    text = re.sub(r"\bdiv\b", r"\\div ", text, flags=re.I)
-    return text
+def hwp_equation_script(payload: bytes) -> Optional[str]:
+    # EQEDIT 레코드: 속성(UINT32), 스크립트 글자 수(WORD), 스크립트(WCHAR), 이어서 글자 크기·색·버전·글꼴 이름.
+    if len(payload) < 6:
+        return None
+    length = struct.unpack_from("<H", payload, 4)[0]
+    end = 6 + length * 2
+    if length == 0 or end > len(payload):
+        return None
+    return payload[6:end].decode("utf-16le", errors="ignore")
+
+
+HWP_EQ_TOKEN_RE = re.compile(
+    r'"[^"]*"'
+    r"|\d+(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+"
+    r"|[A-Za-z]+"
+    r"|[가-힣ㄱ-ㅎㅏ-ㅣ]+"
+    r"|<->|<=>|->|<-|=>|<=|>=|!=|\+-|-\+|<<|>>"
+    r"|\s+"
+    r"|.",
+    re.S,
+)
+HWP_EQ_GREEK = [
+    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu",
+    "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega",
+]
+# LaTeX에 대문자 명령이 없는 그리스 대문자는 모양이 같은 로마자로 쓴다.
+HWP_EQ_GREEK_UPPER_LATIN = {
+    "alpha": "A", "beta": "B", "epsilon": "E", "zeta": "Z", "eta": "H", "iota": "I", "kappa": "K",
+    "mu": "M", "nu": "N", "omicron": "O", "rho": "P", "tau": "T", "chi": "X",
+}
+# 한글 수식에서 대소문자로 뜻이 갈리는 화살표(대문자는 겹화살표).
+HWP_EQ_CASE_SENSITIVE = {
+    "RARROW": r"\Rightarrow", "LARROW": r"\Leftarrow", "LRARROW": r"\Leftrightarrow",
+    "UPARROW": r"\Uparrow", "DOWNARROW": r"\Downarrow",
+}
+HWP_EQ_SYMBOLS = {
+    "times": r"\times", "div": r"\div", "cdot": r"\cdot", "cdots": r"\cdots", "ldots": r"\ldots",
+    "vdots": r"\vdots", "ddots": r"\ddots", "inf": r"\infty", "infinity": r"\infty", "pm": r"\pm", "mp": r"\mp",
+    "neq": r"\neq", "leq": r"\leq", "geq": r"\geq", "approx": r"\approx", "sim": r"\sim", "simeq": r"\simeq",
+    "equiv": r"\equiv", "cong": r"\cong", "propto": r"\propto", "therefore": r"\therefore", "because": r"\because",
+    "in": r"\in", "notin": r"\notin", "ni": r"\ni", "subset": r"\subset", "supset": r"\supset",
+    "subseteq": r"\subseteq", "supseteq": r"\supseteq", "cup": r"\cup", "cap": r"\cap", "emptyset": r"\emptyset",
+    "forall": r"\forall", "exist": r"\exists", "exists": r"\exists", "partial": r"\partial", "nabla": r"\nabla",
+    "angle": r"\angle", "triangle": r"\triangle", "perp": r"\perp", "bot": r"\perp", "prime": "'",
+    "deg": r"^{\circ}", "circ": r"\circ", "bullet": r"\bullet", "star": r"\star", "oplus": r"\oplus",
+    "ominus": r"\ominus", "otimes": r"\otimes", "odot": r"\odot", "vee": r"\vee", "wedge": r"\wedge",
+    "neg": r"\neg", "rarrow": r"\rightarrow", "larrow": r"\leftarrow", "lrarrow": r"\leftrightarrow",
+    "uparrow": r"\uparrow", "downarrow": r"\downarrow", "mapsto": r"\mapsto", "hbar": r"\hbar", "ell": r"\ell",
+    "aleph": r"\aleph", "dagger": r"\dagger", "parallel": r"\parallel", "lceil": r"\lceil", "rceil": r"\rceil",
+    "lfloor": r"\lfloor", "rfloor": r"\rfloor", "vartheta": r"\vartheta", "varphi": r"\varphi",
+    "varepsilon": r"\varepsilon", "varpi": r"\varpi", "varrho": r"\varrho", "varsigma": r"\varsigma",
+    "sum": r"\sum", "prod": r"\prod", "coprod": r"\coprod", "int": r"\int", "dint": r"\iint", "tint": r"\iiint",
+    "oint": r"\oint", "odint": r"\oiint", "otint": r"\oiiint", "inter": r"\bigcap", "union": r"\bigcup",
+    "bigcap": r"\bigcap", "bigcup": r"\bigcup", "bigoplus": r"\bigoplus", "bigotimes": r"\bigotimes",
+    "bigodot": r"\bigodot", "bigvee": r"\bigvee", "bigwedge": r"\bigwedge", "biguplus": r"\biguplus",
+    "bigsqcup": r"\bigsqcup",
+    "sin": r"\sin", "cos": r"\cos", "tan": r"\tan", "cot": r"\cot", "sec": r"\sec", "csc": r"\csc",
+    "arcsin": r"\arcsin", "arccos": r"\arccos", "arctan": r"\arctan", "sinh": r"\sinh", "cosh": r"\cosh",
+    "tanh": r"\tanh", "coth": r"\coth", "log": r"\log", "ln": r"\ln", "lg": r"\lg", "exp": r"\exp",
+    "det": r"\det", "gcd": r"\gcd", "max": r"\max", "min": r"\min", "lim": r"\lim", "mod": r"\bmod",
+}
+HWP_EQ_OPERATORS = {
+    "+-": r"\pm", "-+": r"\mp", "!=": r"\neq", "<=": r"\leq", ">=": r"\geq", "->": r"\rightarrow",
+    "<-": r"\leftarrow", "<->": r"\leftrightarrow", "=>": r"\Rightarrow", "<=>": r"\Leftrightarrow",
+    "<<": r"\ll", ">>": r"\gg", "%": r"\%", "$": r"\$", "\\": r"\backslash", "~": r"\ ", "`": r"\,",
+}
+HWP_EQ_ACCENTS = {
+    "sqrt": r"\sqrt", "vec": r"\vec", "hat": r"\hat", "bar": r"\overline", "dot": r"\dot", "ddot": r"\ddot",
+    "tilde": r"\tilde", "check": r"\check", "acute": r"\acute", "grave": r"\grave", "under": r"\underline",
+    "dyad": r"\overleftrightarrow", "box": r"\boxed", "arch": r"\overset{\frown}",
+}
+HWP_EQ_ENVIRONMENTS = {
+    "matrix": "matrix", "pmatrix": "pmatrix", "bmatrix": "bmatrix", "dmatrix": "vmatrix", "cases": "cases",
+    "pile": "matrix", "lpile": "matrix", "rpile": "matrix", "eqalign": "aligned",
+}
+HWP_EQ_BRACKETS = {"{": r"\{", "}": r"\}", "<": r"\langle", ">": r"\rangle", "dline": r"\|", "line": "|"}
+HWP_EQ_INFIX = {"over", "atop", "choose"}
+HWP_EQ_SCRIPTS = {"^": "^", "_": "_", "sup": "^", "sub": "_", "from": "_", "to": "^", "lsup": "^", "lsub": "_"}
+# 글꼴 모양만 바꾸는 명령은 LaTeX 본문에 영향을 주지 않도록 건너뛴다.
+HWP_EQ_IGNORED = {"rm", "it", "bold"}
+
+
+def latex_unbrace(text: str) -> str:
+    """바깥을 감싼 { }가 하나의 짝이면 벗겨낸다."""
+    if not (text.startswith("{") and text.endswith("}")):
+        return text
+    depth = 0
+    idx = 0
+    while idx < len(text):
+        ch = text[idx]
+        if ch == "\\":
+            idx += 2
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and idx != len(text) - 1:
+                return text
+        idx += 1
+    return text[1:-1]
+
+
+class HwpEquationParser:
+    """한글 수식 스크립트(over, sqrt, LEFT/RIGHT, matrix 등)를 LaTeX로 옮긴다."""
+
+    def __init__(self, script: str) -> None:
+        self.tokens = [tok for tok in HWP_EQ_TOKEN_RE.findall(script) if not tok.isspace()]
+        self.pos = 0
+        self.env_depth = 0
+        self.top_level_rows = False
+
+    def peek(self) -> str:
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else ""
+
+    def parse(self) -> str:
+        latex = self.parse_sequence(closing=False)
+        if self.top_level_rows:
+            latex = f"\\begin{{gathered}} {latex} \\end{{gathered}}"
+        # 짝이 맞지 않는 LEFT/RIGHT는 LaTeX 오류가 나므로 크기 조절 없이 괄호만 남긴다.
+        if len(re.findall(r"\\left(?![a-zA-Z])", latex)) != len(re.findall(r"\\right(?![a-zA-Z])", latex)):
+            latex = re.sub(r"\\(?:left|right)(?![a-zA-Z])\.?", "", latex)
+        return latex
+
+    def parse_sequence(self, closing: bool) -> str:
+        items: list[str] = []
+        while self.pos < len(self.tokens):
+            tok = self.tokens[self.pos]
+            lower = tok.lower()
+            if tok == "}":
+                self.pos += 1
+                if closing:
+                    break
+                continue
+            if lower in HWP_EQ_INFIX:
+                self.pos += 1
+                left = latex_unbrace(items.pop()) if items else ""
+                right = latex_unbrace(self.parse_operand())
+                if lower == "over":
+                    items.append(f"\\frac{{{left}}}{{{right}}}")
+                elif lower == "choose":
+                    items.append(f"\\binom{{{left}}}{{{right}}}")
+                else:
+                    items.append(f"{{{left} \\atop {right}}}")
+                continue
+            if tok in HWP_EQ_SCRIPTS or lower in HWP_EQ_SCRIPTS:
+                self.pos += 1
+                base = items.pop() if items else "{}"
+                items.append(self.attach_script(base, HWP_EQ_SCRIPTS[lower]))
+                continue
+            items.append(self.parse_atom())
+        return " ".join(item for item in items if item)
+
+    def attach_script(self, base: str, mark: str) -> str:
+        return f"{base}{mark}{{{latex_unbrace(self.parse_atom())}}}"
+
+    def parse_operand(self) -> str:
+        operand = self.parse_atom()
+        while self.peek() in HWP_EQ_SCRIPTS or self.peek().lower() in HWP_EQ_SCRIPTS:
+            mark = HWP_EQ_SCRIPTS[self.peek().lower()]
+            self.pos += 1
+            operand = self.attach_script(operand, mark)
+        return operand
+
+    def parse_group(self) -> str:
+        if self.peek() == "{":
+            self.pos += 1
+            return "{" + self.parse_sequence(closing=True) + "}"
+        return self.parse_atom()
+
+    def parse_atom(self) -> str:
+        if self.pos >= len(self.tokens):
+            return ""
+        tok = self.tokens[self.pos]
+        self.pos += 1
+        if tok == "{":
+            return "{" + self.parse_sequence(closing=True) + "}"
+        if tok == "#":
+            if self.env_depth == 0:
+                self.top_level_rows = True
+            return r"\\"
+        if tok == "&":
+            return "&" if self.env_depth else ""
+        if tok.startswith('"') and tok.endswith('"') and len(tok) >= 2:
+            return latex_text(tok[1:-1])
+        if re.match(r"[가-힣ㄱ-ㅎㅏ-ㅣ]", tok):
+            return latex_text(tok)
+        if tok[0].isdigit() or (tok[0] == "." and len(tok) > 1):
+            return tok.replace(",", "{,}")
+        if tok[0].isascii() and tok[0].isalpha():
+            return self.parse_word(tok)
+        return HWP_EQ_OPERATORS.get(tok, "\\" + tok if tok in "{}#&_^" else tok)
+
+    def parse_word(self, word: str) -> str:
+        lower = word.lower()
+        if word in HWP_EQ_CASE_SENSITIVE:
+            return HWP_EQ_CASE_SENSITIVE[word]
+        if lower in HWP_EQ_GREEK:
+            if word.islower():
+                return "o" if lower == "omicron" else "\\" + lower
+            return HWP_EQ_GREEK_UPPER_LATIN.get(lower, "\\" + lower.capitalize())
+        if lower in HWP_EQ_IGNORED:
+            return ""
+        if lower in {"left", "right"}:
+            bracket = self.tokens[self.pos] if self.pos < len(self.tokens) else "."
+            self.pos += 1
+            return f"\\{lower}{HWP_EQ_BRACKETS.get(bracket.lower(), bracket)}"
+        if lower == "root":
+            degree = latex_unbrace(self.parse_atom())
+            if self.peek().lower() == "of":
+                self.pos += 1
+            return f"\\sqrt[{degree}]{{{latex_unbrace(self.parse_atom())}}}"
+        if lower in HWP_EQ_ACCENTS:
+            return f"{HWP_EQ_ACCENTS[lower]}{{{latex_unbrace(self.parse_atom())}}}"
+        if lower in HWP_EQ_ENVIRONMENTS and self.peek() == "{":
+            env = HWP_EQ_ENVIRONMENTS[lower]
+            self.pos += 1
+            self.env_depth += 1
+            body = self.parse_sequence(closing=True)
+            self.env_depth -= 1
+            return f"\\begin{{{env}}} {body} \\end{{{env}}}"
+        return HWP_EQ_SYMBOLS.get(lower, word)
+
+
+def latex_text(text: str) -> str:
+    text = re.sub(r"[{}\\]", "", text)
+    text = re.sub(r"([%$#&_^~])", r"\\\1", text)
+    return f"\\text{{{text}}}" if text else ""
+
+
+def hwp_equation_to_latex(script: str) -> str:
+    script = script.strip()
+    try:
+        latex = HwpEquationParser(script).parse()
+    except RecursionError:
+        return script
+    return re.sub(r"\s+", " ", latex).strip()
 
 
 def extract_hwp_footnote(records: list[tuple[int, int, bytes]], start_idx: int) -> tuple[str, int]:
@@ -1063,6 +1430,9 @@ def count_equation_fallbacks(blocks: list[Block]) -> int:
                 total += sum(cell.text.count(r"\(") for cell in block.cells)
             elif block.rows:
                 total += sum(cell.count(r"\(") for row in block.rows for cell in row)
+        elif block.type != "equation" and block.text:
+            # 칸 하나짜리 표는 문단으로 풀리므로 그 안의 수식도 센다.
+            total += block.text.count(r"\(")
     return total
 
 
@@ -1179,11 +1549,16 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
         encrypted = bool(flags & 0x02)
         if encrypted:
             raise ConversionError("암호화된 HWP 문서는 지원하지 않습니다.")
+        # 배포용 문서는 BodyText에 "배포용 문서입니다" 안내문만 있고 실제 본문은 ViewText에 암호화되어 있다.
+        distributed = bool(flags & 0x04)
+        body_storage = "ViewText" if distributed else "BodyText"
+        if distributed:
+            warnings.append(WarningItem("DISTRIBUTION_DOC_DECRYPTED", "배포용 문서(복사·인쇄 제한)의 본문을 풀어 변환했습니다. 작성자가 정한 이용 범위 안에서 사용하세요."))
 
-        sections = [s for s in ole.listdir(streams=True, storages=False) if len(s) == 2 and s[0] == "BodyText" and s[1].lower().startswith("section")]
+        sections = [s for s in ole.listdir(streams=True, storages=False) if len(s) == 2 and s[0] == body_storage and s[1].lower().startswith("section")]
         sections.sort(key=lambda s: int(re.sub(r"\D+", "", s[1]) or "0"))
         if not sections:
-            raise ConversionError("BodyText/Section 스트림을 찾을 수 없습니다.")
+            raise ConversionError(f"{body_storage}/Section 스트림을 찾을 수 없습니다.")
 
         para_count = 0
         record_count = 0
@@ -1193,9 +1568,9 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
         repeated_header_footer = 0
         for section in sections:
             try:
-                data = read_hwp_stream(ole, section, compressed)
+                data = read_hwp_stream(ole, section, compressed, distributed)
             except Exception as exc:
-                warnings.append(WarningItem("SECTION_DECOMPRESS_FAILED", f"{ole_stream_name(section)} 압축 해제 실패: {exc}", ole_stream_name(section)))
+                warnings.append(WarningItem("SECTION_DECOMPRESS_FAILED", f"{ole_stream_name(section)} {'복호화/' if distributed else ''}압축 해제 실패: {exc}", ole_stream_name(section)))
                 continue
             records = list(parse_hwp_records(data))
             for rec_tag, _rec_level, rec_payload in records:
@@ -1578,6 +1953,10 @@ def collect_text_with_inline_styles(elem: ET.Element, skip: Optional[set[int]] =
         return "\n"
     if name == "tab":
         return "\t"
+    if name == "equation":
+        # 수식은 <hp:script>의 한글 수식 스크립트만 LaTeX로 옮기고 설명문(shapeComment) 등은 넣지 않는다.
+        script = next((child.text for child in elem.iter() if local_name(child) == "script"), None) or ""
+        return rf"\({hwp_equation_to_latex(script)}\)" if script.strip() else ""
     parts: list[str] = []
     if elem.text:
         parts.append(elem.text)

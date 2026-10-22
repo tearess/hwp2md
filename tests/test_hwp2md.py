@@ -1,5 +1,7 @@
+import struct
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import hwp2md
 
@@ -112,12 +114,97 @@ class Hwp2MdUnitTests(unittest.TestCase):
         self.assertTrue(png and png.startswith(b"\x89PNG"))
         self.assertEqual(hwp2md.image_dimensions_from_bytes(png or b""), (1, 1))
 
-    def test_hwp_equation_fallback_extracts_fraction(self) -> None:
-        payload = ("\x00\x00\x0c{8} over {100}\r\n\r\nϨ A Equation Version 60\x00HYhwpEQ").encode("utf-16le")
+    def test_hwp_equation_record_reads_length_prefixed_script(self) -> None:
+        # 실제 EQEDIT 레코드: 속성, 스크립트 글자 수, 스크립트, 그 뒤에 크기·버전·글꼴 이름이 붙는다.
+        script = "{8} over {100}"
+        tail = "Ϩ\x00\x00\x00A\x00\x13Equation Version 60\x09HancomEQN"
+        payload = struct.pack("<IH", 0, len(script)) + script.encode("utf-16le") + tail.encode("utf-16le")
 
-        equation = hwp2md.normalize_hwp_equation(payload)
+        self.assertEqual(hwp2md.normalize_hwp_equation(payload), r"\frac{8}{100}")
 
-        self.assertEqual(equation, r"\frac{8}{100}")
+    def test_hwp_equation_falls_back_when_length_is_broken(self) -> None:
+        payload = struct.pack("<IH", 0, 0xFFFF) + "7over100\r\n\r\nϨ\x00\x00\x00C\x00\x00\x07HYhwpEQ".encode("utf-16le")
+
+        self.assertEqual(hwp2md.normalize_hwp_equation(payload), r"\frac{7}{100}")
+
+    def test_hwp_equation_empty_script_is_none(self) -> None:
+        payload = struct.pack("<IH", 0, 4) + "  \r\n".encode("utf-16le")
+
+        self.assertIsNone(hwp2md.normalize_hwp_equation(payload))
+
+    def test_hwp_equation_to_latex_structures(self) -> None:
+        cases = {
+            "{300,000,000} over {500,000,000}": r"\frac{300{,}000{,}000}{500{,}000{,}000}",
+            "{110,000,000} over {200,000,000}  TIMES 20%": r"\frac{110{,}000{,}000}{200{,}000{,}000} \times 20 \%",
+            "H _{n} = {a(r ^{n} -1)} over {r-1} (r != 1)": r"H_{n} = \frac{a ( r^{n} - 1 )}{r - 1} ( r \neq 1 )",
+            "x = {-b +- sqrt{b^2 -4ac}} over {2a}": r"x = \frac{- b \pm \sqrt{b^{2} - 4 ac}}{2 a}",
+            "sum from {i=1} to n i": r"\sum_{i = 1}^{n} i",
+            "lim _{x -> 0} {sin x} over x": r"\lim_{x \rightarrow 0} \frac{\sin x}{x}",
+            "root 3 of {x+1}": r"\sqrt[3]{x + 1}",
+            " LEFT ( { 기정} atop {준공 }  RIGHT )   \r\n": r"\left( {\text{기정} \atop \text{준공}} \right)",
+            "cases{x & x>=0 # -x & x<0}": r"\begin{cases} x & x \geq 0 \\ - x & x < 0 \end{cases}",
+            "dmatrix{a&b#c&d}": r"\begin{vmatrix} a & b \\ c & d \end{vmatrix}",
+            "alpha + BETA + GAMMA": r"\alpha + B + \Gamma",
+            "a RARROW b rarrow c": r"a \Rightarrow b \rightarrow c",
+            "{`토지``지분} over {감정평가액}": r"\frac{\, \text{토지} \, \, \text{지분}}{\text{감정평가액}}",
+            "a # b": r"\begin{gathered} a \\ b \end{gathered}",
+        }
+        for script, expected in cases.items():
+            with self.subTest(script=script):
+                self.assertEqual(hwp2md.hwp_equation_to_latex(script), expected)
+
+    def test_hwp_equation_unbalanced_input_stays_valid(self) -> None:
+        # 짝이 맞지 않는 괄호나 LEFT/RIGHT가 있어도 LaTeX 괄호 짝은 맞아야 한다.
+        self.assertEqual(hwp2md.hwp_equation_to_latex("{{a"), "{{a}}")
+        self.assertEqual(hwp2md.hwp_equation_to_latex("}}a"), "a")
+        self.assertEqual(hwp2md.hwp_equation_to_latex("LEFT ( x"), "( x")
+
+    def test_escape_md_text_keeps_inline_math(self) -> None:
+        text = hwp2md.escape_md_text(r"값은 \(\frac{a_1}{b}\) 이고 a_b")
+
+        self.assertEqual(text, r"값은 \(\frac{a_1}{b}\) 이고 a\_b")
+
+    def test_hwpx_equation_script_becomes_inline_latex(self) -> None:
+        xml = (
+            '<hp:p xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"><hp:run><hp:t>등락률 : </hp:t>'
+            '<hp:equation><hp:shapeComment>수식입니다.</hp:shapeComment><hp:script>{a-b} over b</hp:script></hp:equation>'
+            "</hp:run></hp:p>"
+        )
+
+        self.assertEqual(hwp2md.collect_text(ET.fromstring(xml)), r"등락률 : \(\frac{a - b}{b}\)")
+
+    def test_aes128_decrypt_matches_fips197_vector(self) -> None:
+        key = bytes(range(16))
+        ciphertext = bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a")
+
+        self.assertEqual(hwp2md.aes128_ecb_decrypt(key, ciphertext * 2), bytes.fromhex("00112233445566778899aabbccddeeff") * 2)
+
+    def test_distribution_view_text_is_decrypted(self) -> None:
+        key = bytes(range(16))
+        seed = 0x12345677
+        plain = bytearray(256)
+        plain[0:4] = struct.pack("<I", seed)
+        offset = 4 + (seed & 0x0F)
+        plain[offset : offset + 16] = key
+        # 배포용 문서는 MSVC rand() 값으로 씨앗 뒤 252바이트를 XOR해 키를 숨긴다.
+        state, count, value = seed, 0, 0
+        for i in range(256):
+            if count == 0:
+                state = (state * 214013 + 2531011) & 0xFFFFFFFF
+                value = (state >> 16) & 0xFF
+                state = (state * 214013 + 2531011) & 0xFFFFFFFF
+                count = ((state >> 16) & 0x0F) + 1
+            if i >= 4:
+                plain[i] ^= value
+            count -= 1
+        header = struct.pack("<I", hwp2md.HWP_DISTRIBUTE_DOC_DATA_TAG | (256 << 20))
+        stream = header + bytes(plain) + bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a") + b"\x00" * 5
+
+        self.assertEqual(hwp2md.decrypt_hwp_view_text(stream), bytes.fromhex("00112233445566778899aabbccddeeff"))
+
+    def test_distribution_view_text_without_key_record_is_rejected(self) -> None:
+        with self.assertRaises(hwp2md.ConversionError):
+            hwp2md.decrypt_hwp_view_text(b"\x00" * 300)
 
     def test_caption_following_image_anchor_prevents_duplicate_caption_insert(self) -> None:
         blocks = [
