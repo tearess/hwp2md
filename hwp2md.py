@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 from xml.etree import ElementTree as ET
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 ASSET_MANIFEST_NAME = ".hwp2md-assets.json"
 PAGE_ARTIFACT_MAX_ROWS = 8
 NON_CONTENT_BLOCK_TYPES = frozenset({"metadata", "page_artifact"})
@@ -2776,8 +2776,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--format", choices=["gfm", "commonmark", "obsidian"], default="gfm", help="Markdown 출력 방언")
     parser.add_argument("--heading-policy", choices=["style", "outline", "font", "none"], default="font", help="제목 추론 정책")
     parser.add_argument("--table-mode", choices=["gfm", "html", "hybrid"], default="hybrid", help="표 출력 방식")
-    parser.add_argument("--image-mode", choices=["extract", "embed", "skip"], default="extract", help="이미지 처리 방식. embed는 v0.1.0에서 extract와 동일하게 동작")
-    parser.add_argument("--equation-mode", choices=["latex", "image", "both", "skip"], default="latex", help="수식 처리 방식. v0.1.0에서는 원문 보존 중심")
+    parser.add_argument("--image-mode", choices=["extract", "embed", "skip"], default="extract", help="이미지 처리 방식. embed는 현재 extract와 동일하게 동작")
+    parser.add_argument("--equation-mode", choices=["latex", "image", "both", "skip"], default="latex", help="수식 처리 방식. image와 both는 현재 latex와 동일하게 동작")
     parser.add_argument("--frontmatter", choices=["none", "yaml"], default="yaml", help="YAML frontmatter 출력 여부")
     parser.add_argument("--include-page-artifacts", action="store_true", help="머리말/꼬리말 등 페이지 부속 정보를 가능한 경우 포함")
     parser.add_argument("--no-clean-assets", action="store_true", help="재변환 시 기존 generated assets 정리를 건너뜁니다.")

@@ -116,7 +116,7 @@ python hwp2md.py --batch "*.hwpx" -o converted
 | --- | --- | --- |
 | `-o, --output <path>` | 입력 파일명 기반 | 출력 Markdown 경로입니다. 일괄 변환에서는 출력 폴더로 사용합니다. |
 | `--assets-dir <path>` | `<output>.assets` | 이미지/첨부 자산을 저장할 폴더입니다. |
-| `--format <gfm\|commonmark\|obsidian>` | `gfm` | Markdown 출력 방언입니다. 현재 v0.1.0에서는 GFM 중심으로 렌더링합니다. |
+| `--format <gfm\|commonmark\|obsidian>` | `gfm` | Markdown 출력 방언입니다. 현재는 GFM 중심으로 렌더링합니다. |
 | `--heading-policy <style\|outline\|font\|none>` | `font` | 제목 추론 정책입니다. `none`이면 모든 텍스트를 일반 문단 중심으로 둡니다. |
 | `--table-mode <gfm\|html\|hybrid>` | `hybrid` | 표 후보의 출력 방식입니다. 단순 표는 GFM, 병합 셀이 있는 복잡한 표는 HTML로 출력합니다. |
 | `--image-mode <extract\|embed\|skip>` | `extract` | 이미지 처리 방식입니다. `embed`는 현재 `extract`와 동일하게 동작합니다. |
