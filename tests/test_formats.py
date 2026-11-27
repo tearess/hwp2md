@@ -8,7 +8,13 @@ from unittest import mock
 from xml.etree import ElementTree as ET
 from pathlib import Path
 
+import contextlib
+import io
+
 import hwp2md
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (16).to_bytes(4, "big") + (16).to_bytes(4, "big") + b"\x08\x02\x00\x00\x00"
 
 
 def make_cells(rows: int, cols: int, text: str) -> list[hwp2md.TableCell]:
@@ -760,6 +766,155 @@ class NestedTableTests(unittest.TestCase):
         for expected in ("바깥 문단", "안쪽 가", "안쪽 나", "안쪽 다", "안쪽 라"):
             self.assertIn(expected, text)
         self.assertEqual(next_idx, len(records))
+
+
+class AssetExtensionSanitizationTests(unittest.TestCase):
+    # 문서에 심어진 BinData 이름의 확장자를 그대로 쓰면 .html/.exe가 사용자 폴더에 생긴다.
+
+    def convert(self, path: Path) -> hwp2md.ConvertResult:
+        return hwp2md.convert_file(path, path.with_suffix(".md"), path.parent / "assets", None, hwp2md.ConvertOptions(frontmatter="none"))
+
+    def test_script_and_executable_bindata_are_saved_as_bin(self) -> None:
+        entries = {
+            "BinData/BIN0001.html": b"<script>alert(1)</script>",
+            "BinData/BIN0002.exe": b"MZ" + bytes(62),
+            "BinData/BIN0003.png": PNG_MAGIC,
+            "BinData/BIN0004.svg": b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+            "BinData/BIN0005.js": b"alert(document.cookie)",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ext_test.hwpx"
+            write_limit_hwpx(path, entries)
+            result = self.convert(path)
+            written = sorted(p.name for p in (Path(tmp) / "assets").iterdir() if p.is_file())
+            exe_bytes = (Path(tmp) / "assets" / "image-002.bin").read_bytes()
+
+        self.assertEqual(
+            [a.output for a in result.assets],
+            ["image-001.bin", "image-002.bin", "image-003.png", "image-004.bin", "image-005.bin"],
+        )
+        self.assertEqual(written, sorted(["image-001.bin", "image-002.bin", "image-003.png", "image-004.bin", "image-005.bin", hwp2md.ASSET_MANIFEST_NAME]))
+        # 내용은 보존하되 위험한 확장자만 .bin으로 바꾼다.
+        self.assertEqual(exe_bytes, entries["BinData/BIN0002.exe"])
+        sanitized = [w for w in result.report["warnings"] if w["code"] == "ASSET_EXTENSION_SANITIZED"]
+        self.assertEqual(len(sanitized), 4)
+        for name in ("BIN0001.html", "BIN0002.exe", "BIN0004.svg", "BIN0005.js"):
+            self.assertTrue(any(name in w["message"] for w in sanitized), name)
+        # 산출 마크다운이 실행 파일·스크립트를 링크하면 안 된다.
+        self.assertIn("image-001.bin", result.markdown)
+        self.assertNotIn("image-001.html", result.markdown)
+        self.assertNotIn("image-002.exe", result.markdown)
+        self.assertNotIn("image-004.svg", result.markdown)
+
+    def test_safe_image_extensions_are_kept(self) -> None:
+        entries = {
+            "BinData/BIN0001.jpg": b"\xff\xd8\xff\xe0" + bytes(40),
+            "BinData/BIN0002.jpeg": b"\xff\xd8\xff\xe1" + bytes(40),
+            "BinData/BIN0003.gif": b"GIF89a" + bytes(40),
+            "BinData/BIN0004.tif": b"II*\x00" + bytes(40),
+            "BinData/BIN0005.emf": bytes(40),
+            "BinData/BIN0006.webp": b"RIFF" + (8).to_bytes(4, "little") + b"WEBP" + bytes(40),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "safe_ext.hwpx"
+            write_limit_hwpx(path, entries)
+            result = self.convert(path)
+
+        self.assertEqual(
+            [a.output for a in result.assets],
+            ["image-001.jpg", "image-002.jpeg", "image-003.gif", "image-004.tif", "image-005.emf", "image-006.webp"],
+        )
+        self.assertNotIn("ASSET_EXTENSION_SANITIZED", [w["code"] for w in result.report["warnings"]])
+
+    def test_unknown_extension_falls_back_to_bin_without_noise(self) -> None:
+        # 그림 형식을 알 수 없는 자산은 이미 안전한 .bin이므로 경고를 되풀이하지 않는다.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unknown.hwpx"
+            write_limit_hwpx(path, {"BinData/BIN0001": bytes(40)})
+            result = self.convert(path)
+            written = sorted(p.name for p in (Path(tmp) / "assets").iterdir() if p.is_file())
+        self.assertEqual([a.output for a in result.assets], ["image-001.bin"])
+        self.assertIn("image-001.bin", written)
+        self.assertNotIn("ASSET_EXTENSION_SANITIZED", [w["code"] for w in result.report["warnings"]])
+
+    def test_sanitize_asset_extension_direct(self) -> None:
+        warnings: list[hwp2md.WarningItem] = []
+        self.assertEqual(hwp2md.sanitize_asset_extension(".PNG", "BinData/BIN0001.png", warnings), ".png")
+        self.assertEqual(hwp2md.sanitize_asset_extension("exe", "BinData/BIN0002.exe", warnings), ".bin")
+        self.assertEqual(hwp2md.sanitize_asset_extension("", "BinData/BIN0003", warnings), ".bin")
+        self.assertEqual([w.code for w in warnings], ["ASSET_EXTENSION_SANITIZED"])
+
+
+class OutputOverwriteSafetyTests(unittest.TestCase):
+
+    # CLI가 사용자가 고친 .md를 확인 없이 지우지 않는지 검증한다.
+    def test_existing_markdown_is_kept_and_new_name_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "보고서.hwpx"
+            write_limit_hwpx(src, {})
+            existing = Path(tmp) / "보고서.md"
+            existing.write_text("내가 직접 고친 메모입니다.\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = hwp2md.main([str(src)])
+            self.assertEqual(code, 0)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "내가 직접 고친 메모입니다.\n")
+            new_md = Path(tmp) / "보고서-2.md"
+            self.assertTrue(new_md.is_file())
+            self.assertIn("본문", new_md.read_text(encoding="utf-8"))
+            self.assertTrue((Path(tmp) / "보고서-2.report.json").is_file())
+
+    def test_force_flag_overwrites_existing_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "보고서.hwpx"
+            write_limit_hwpx(src, {})
+            existing = Path(tmp) / "보고서.md"
+            existing.write_text("내가 직접 고친 메모입니다.\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = hwp2md.main([str(src), "--force"])
+            self.assertEqual(code, 0)
+            self.assertIn("본문", existing.read_text(encoding="utf-8"))
+            self.assertFalse((Path(tmp) / "보고서-2.md").exists())
+
+    def test_overwrite_alias_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "보고서.hwpx"
+            write_limit_hwpx(src, {})
+            existing = Path(tmp) / "보고서.md"
+            existing.write_text("이전 변환 결과\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(hwp2md.main([str(src), "--overwrite"]), 0)
+            self.assertIn("본문", existing.read_text(encoding="utf-8"))
+
+    def test_batch_run_twice_keeps_previous_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a", "b"):
+                write_limit_hwpx(Path(tmp) / f"{name}.hwpx", {"BinData/BIN0001.png": PNG_MAGIC})
+            out_dir = Path(tmp) / "out"
+            for _ in range(2):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = hwp2md.main(["--batch", str(Path(tmp) / "*.hwpx"), "-o", str(out_dir)])
+                self.assertEqual(code, 0)
+            self.assertEqual(sorted(p.name for p in out_dir.glob("*.md")), ["a-2.md", "a.md", "b-2.md", "b.md"])
+            # 각 회차의 산출물이 서로 다른 자산 폴더를 쓰고 이전 폴더를 지우지 않는다.
+            self.assertEqual(sorted(p.name for p in out_dir.iterdir() if p.is_dir()), ["a-2.assets", "a.assets", "b-2.assets", "b.assets"])
+
+    def test_atomic_write_keeps_old_file_when_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "보고서.md"
+            target.write_text("원본", encoding="utf-8")
+            with mock.patch("os.replace", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                hwp2md.atomic_write_text(target, "새 내용")
+            self.assertEqual(target.read_text(encoding="utf-8"), "원본")
+            # 실패한 임시 파일이 남지 않는다.
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["보고서.md"])
+
+    def test_atomic_write_replaces_content_and_cleans_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "보고서.md"
+            target.write_text("이전", encoding="utf-8")
+            hwp2md.atomic_write_text(target, "새 내용")
+            self.assertEqual(target.read_text(encoding="utf-8"), "새 내용")
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["보고서.md"])
 
 
 if __name__ == "__main__":

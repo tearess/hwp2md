@@ -353,90 +353,86 @@ class Hwp2MdUnitTests(unittest.TestCase):
         self.assertEqual(hwp2md.content_blocks(blocks), [])
 
     def test_clean_generated_assets_removes_only_current_stem_outputs(self) -> None:
-        assets_dir = ROOT / "sample_output" / "_unit_assets"
-        assets_dir.mkdir(exist_ok=True)
-        generated = assets_dir / "image-001.bmp"
-        unrelated = assets_dir / "image-002.png"
-        hwp2md.write_asset_manifest(assets_dir, [hwp2md.Asset(source="s", output="image-001.bmp", kind="image", bytes=1)])
-        legacy_generated = assets_dir / "문서-001.bmp"
-        other = assets_dir / "다른문서-001.bmp"
-        generated.write_bytes(b"old")
-        unrelated.write_bytes(b"keep")
-        legacy_generated.write_bytes(b"legacy")
-        other.write_bytes(b"keep")
+        with tempfile.TemporaryDirectory() as tmp:
+            assets_dir = Path(tmp) / "_unit_assets"
+            assets_dir.mkdir()
+            generated = assets_dir / "image-001.bmp"
+            unrelated = assets_dir / "image-002.png"
+            hwp2md.write_asset_manifest(assets_dir, [hwp2md.Asset(source="s", output="image-001.bmp", kind="image", bytes=1)])
+            legacy_generated = assets_dir / "문서-001.bmp"
+            other = assets_dir / "다른문서-001.bmp"
+            generated.write_bytes(b"old")
+            unrelated.write_bytes(b"keep")
+            legacy_generated.write_bytes(b"legacy")
+            other.write_bytes(b"keep")
 
-        removed = hwp2md.clean_generated_assets(assets_dir, "문서")
+            removed = hwp2md.clean_generated_assets(assets_dir, "문서")
 
-        self.assertEqual(removed, 2)
-        self.assertFalse(generated.exists())
-        self.assertFalse(legacy_generated.exists())
-        self.assertTrue(other.exists())
-        self.assertTrue(unrelated.exists(), "매니페스트에 없는 image-NNN 파일은 지우면 안 됩니다")
-        other.unlink()
-        unrelated.unlink()
-        (assets_dir / hwp2md.ASSET_MANIFEST_NAME).unlink()
-        assets_dir.rmdir()
+            self.assertEqual(removed, 2)
+            self.assertFalse(generated.exists())
+            self.assertFalse(legacy_generated.exists())
+            self.assertTrue(other.exists())
+            self.assertTrue(unrelated.exists(), "매니페스트에 없는 image-NNN 파일은 지우면 안 됩니다")
 
     def test_generated_asset_name_stays_short_for_long_source_names(self) -> None:
         self.assertEqual(hwp2md.generated_asset_name(1, ".png"), "image-001.png")
         self.assertLess(len(hwp2md.generated_asset_name(999, "jpeg")), 20)
 
     def test_render_markdown_places_image_anchor_once(self) -> None:
-        assets_dir = ROOT / "sample_output" / "_unit_anchor.assets"
-        assets_dir.mkdir(exist_ok=True)
-        image = assets_dir / "image-001.png"
-        image.write_bytes(
-            b"\x89PNG\r\n\x1a\n"
-            + b"\x00\x00\x00\rIHDR"
-            + (300).to_bytes(4, "big")
-            + (300).to_bytes(4, "big")
-            + b"\x08\x02\x00\x00\x00"
-        )
-        blocks = [
-            hwp2md.Block(type="paragraph", text="< 그림 추이 >"),
-            hwp2md.Block(type="image_anchor", text="< 그림 추이 >", alt="< 그림 추이 >"),
-        ]
-        assets = [hwp2md.Asset(source="BinData/BIN0001.png", output="image-001.png", kind="image", bytes=100)]
-        report = {"format": "hwp", "metadata": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            out_root = Path(tmp) / "sample_output"
+            out_root.mkdir()
+            assets_dir = out_root / "_unit_anchor.assets"
+            assets_dir.mkdir()
+            image = assets_dir / "image-001.png"
+            image.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                + b"\x00\x00\x00\rIHDR"
+                + (300).to_bytes(4, "big")
+                + (300).to_bytes(4, "big")
+                + b"\x08\x02\x00\x00\x00"
+            )
+            blocks = [
+                hwp2md.Block(type="paragraph", text="< 그림 추이 >"),
+                hwp2md.Block(type="image_anchor", text="< 그림 추이 >", alt="< 그림 추이 >"),
+            ]
+            assets = [hwp2md.Asset(source="BinData/BIN0001.png", output="image-001.png", kind="image", bytes=100)]
+            report = {"format": "hwp", "metadata": {}}
 
-        markdown = hwp2md.render_markdown(Path("sample.hwp"), blocks, assets, report, hwp2md.ConvertOptions(frontmatter="none"), ROOT / "sample_output" / "_unit_anchor.md", assets_dir)
+            markdown = hwp2md.render_markdown(Path("sample.hwp"), blocks, assets, report, hwp2md.ConvertOptions(frontmatter="none"), out_root / "_unit_anchor.md", assets_dir)
 
         self.assertEqual(markdown.count("![< 그림 추이 >]"), 1)
-        image.unlink()
-        assets_dir.rmdir()
 
     def test_asset_position_summary_counts_caption_fallbacks(self) -> None:
-        assets_dir = ROOT / "sample_output" / "_unit_position.assets"
-        assets_dir.mkdir(exist_ok=True)
-        image_a = assets_dir / "image-001.png"
-        image_b = assets_dir / "image-002.png"
-        png_header = (
-            b"\x89PNG\r\n\x1a\n"
-            + b"\x00\x00\x00\rIHDR"
-            + (300).to_bytes(4, "big")
-            + (300).to_bytes(4, "big")
-            + b"\x08\x02\x00\x00\x00"
-        )
-        image_a.write_bytes(png_header)
-        image_b.write_bytes(png_header)
-        blocks = [hwp2md.Block(type="paragraph", text="< \ucd94\uc774 >")]
-        assets = [
-            hwp2md.Asset(source="BinData/BIN0001.png", output="image-001.png", kind="image", bytes=100),
-            hwp2md.Asset(source="BinData/BIN0002.png", output="image-002.png", kind="image", bytes=100),
-        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            assets_dir = Path(tmp) / "_unit_position.assets"
+            assets_dir.mkdir()
+            image_a = assets_dir / "image-001.png"
+            image_b = assets_dir / "image-002.png"
+            png_header = (
+                b"\x89PNG\r\n\x1a\n"
+                + b"\x00\x00\x00\rIHDR"
+                + (300).to_bytes(4, "big")
+                + (300).to_bytes(4, "big")
+                + b"\x08\x02\x00\x00\x00"
+            )
+            image_a.write_bytes(png_header)
+            image_b.write_bytes(png_header)
+            blocks = [hwp2md.Block(type="paragraph", text="< \ucd94\uc774 >")]
+            assets = [
+                hwp2md.Asset(source="BinData/BIN0001.png", output="image-001.png", kind="image", bytes=100),
+                hwp2md.Asset(source="BinData/BIN0002.png", output="image-002.png", kind="image", bytes=100),
+            ]
 
-        summary = hwp2md.summarize_asset_placements(assets, blocks, assets_dir)
+            summary = hwp2md.summarize_asset_placements(assets, blocks, assets_dir)
 
-        self.assertEqual(summary.caption, 1)
-        self.assertEqual(summary.approximated, 1)
-        warnings: list[hwp2md.WarningItem] = []
-        losses: list[hwp2md.LossItem] = []
-        hwp2md.add_asset_position_warnings(assets, blocks, assets_dir, warnings, losses)
+            self.assertEqual(summary.caption, 1)
+            self.assertEqual(summary.approximated, 1)
+            warnings: list[hwp2md.WarningItem] = []
+            losses: list[hwp2md.LossItem] = []
+            hwp2md.add_asset_position_warnings(assets, blocks, assets_dir, warnings, losses)
         self.assertIn("ASSET_POSITION_FROM_CAPTION", [item.code for item in warnings])
         self.assertIn(("ASSET_INLINE_POSITION_APPROXIMATED", 1), [(item.code, item.count) for item in losses])
-        image_a.unlink()
-        image_b.unlink()
-        assets_dir.rmdir()
 
 
 @unittest.skipUnless(SAMPLE_170508.exists(), "sample HWP file is not available")

@@ -89,6 +89,8 @@ run_webapp.bat
 
 `-o`를 지정하지 않는 단건 변환과 `--batch` 일괄 변환은 원본 문서의 파일명을 그대로 사용하고 확장자만 `.md`로 바꿉니다. 예를 들어 `보고서.hwp`는 `보고서.md`로 생성됩니다.
 
+같은 이름의 `.md`가 이미 있으면 덮어쓰지 않고 `보고서-2.md`처럼 번호를 붙여 저장합니다. GUI와 같은 규칙입니다. 덮어쓰려면 `--force`(또는 `--overwrite`)를 지정합니다. 파일 쓰기는 임시 파일에 먼저 쓴 뒤 교체하는 방식이라, 변환 도중에 중단되어도 기존 파일이 잘린 채로 남지 않습니다.
+
 ## 일괄 변환
 
 현재 폴더의 모든 HWP 파일을 `converted` 폴더로 변환하려면 다음 명령을 사용합니다.
@@ -124,6 +126,7 @@ python hwp2md.py --batch "*.hwpx" -o converted
 | `--frontmatter <none\|yaml>` | `yaml` | Markdown 상단 YAML frontmatter 출력 여부입니다. |
 | `--report <path>` | `<output>.report.json` | 변환 리포트 JSON 경로입니다. |
 | `--strict` | 꺼짐 | 경고나 손실 항목이 있으면 실패 처리합니다. |
+| `--force, --overwrite` | 꺼짐 | 이미 있는 출력 `.md` 파일을 덮어씁니다. 지정하지 않으면 `이름-2.md`로 저장합니다. |
 | `--dump-ir` | 꺼짐 | 개발자용 중간 IR JSON을 함께 출력합니다. |
 
 ## 현재 구현 범위와 한계

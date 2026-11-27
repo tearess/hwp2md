@@ -3,14 +3,30 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 import hwp2md
-import hwp2md_gui
+
+try:
+    import hwp2md_gui
+except (ImportError, OSError) as exc:  # tkinter가 없는 헤드리스·서버 환경에서는 GUI 모듈을 쓸 수 없다(보통 libtk 누락 ImportError).
+    hwp2md_gui = None  # type: ignore[assignment]
+    GUI_IMPORT_ERROR: Optional[str] = f"{type(exc).__name__}: {exc}"
+else:
+    GUI_IMPORT_ERROR = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "170508(조간) 16년말 외국인이 보유한 국내 토지는 233제곱키로미터 전 국토의 0.2퍼센트(토지정책과).hwp"
+GUI_SKIP_REASON = f"GUI(tkinter)를 사용할 수 없습니다: {GUI_IMPORT_ERROR}" if GUI_IMPORT_ERROR else ""
+
+
+requires_gui = unittest.skipIf(GUI_IMPORT_ERROR is not None, GUI_SKIP_REASON)
+requires_gui_and_sample = unittest.skipIf(
+    GUI_IMPORT_ERROR is not None or not SAMPLE.exists(),
+    GUI_SKIP_REASON or "sample HWP file is not available",
+)
 
 
 def drain(events: "queue.Queue[tuple[str, object]]") -> list[tuple[str, object]]:
@@ -20,6 +36,7 @@ def drain(events: "queue.Queue[tuple[str, object]]") -> list[tuple[str, object]]
     return items
 
 
+@requires_gui_and_sample
 class GuiWorkerTests(unittest.TestCase):
     def run_worker(self, files, out_dir):
         stub = SimpleNamespace(events=queue.Queue())
@@ -52,6 +69,7 @@ class GuiWorkerTests(unittest.TestCase):
             self.assertEqual(events[0][0], "fatal")
 
 
+@requires_gui
 class PackagedAppTests(unittest.TestCase):
     def test_default_output_dir_when_run_from_source(self) -> None:
         self.assertEqual(hwp2md_gui.default_output_dir(), hwp2md_gui.APP_ROOT / "converted")
