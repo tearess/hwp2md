@@ -19,6 +19,7 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import time
 import zipfile
 import zlib
@@ -28,6 +29,9 @@ from xml.etree import ElementTree as ET
 
 VERSION = "0.2.0"
 ASSET_MANIFEST_NAME = ".hwp2md-assets.json"
+# 문서에 심어진 BinData 이름의 확장자를 그대로 믿으면 .html/.exe 같은 파일이 사용자 폴더에 생긴다.
+# 그림으로 열어도 실행되지 않는 포맷만 허용하고, 나머지는 .bin으로 저장한다.
+SAFE_ASSET_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".wmf", ".emf"})
 PAGE_ARTIFACT_MAX_ROWS = 8
 NON_CONTENT_BLOCK_TYPES = frozenset({"metadata", "page_artifact"})
 CORRUPT_FILE_ERRORS = (zipfile.BadZipFile, zlib.error, struct.error, ValueError, KeyError, EOFError, IndexError, ET.ParseError, RecursionError)
@@ -181,6 +185,48 @@ def detect_format(path: Path) -> str:
 
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def default_file_mode() -> int:
+    # 새 산출물은 일반적인 파일처럼(대개 0644) 만들어야 다른 도구가 읽을 수 있다.
+    # mkstemp는 0600으로 만들기 때문에 여기서 umask를 한 번 읽어 기본 권한을 정한다.
+    current = os.umask(0)
+    os.umask(current)
+    return 0o666 & ~current
+
+
+DEFAULT_FILE_MODE = default_file_mode()
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """같은 폴더의 임시 파일에 먼저 쓴 뒤 os.replace로 교체한다.
+
+    쓰기 도중 중단되어도 기존 파일이 잘린 채로 남거나 먼저 지워지지 않는다.
+    """
+    ensure_parent(path)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            # 임시 파일은 0600으로 만들어지므로, 기존 파일의 권한을 잇거나 기본 권한으로 되돌린다.
+            mode = (path.stat().st_mode & 0o777) if path.exists() else DEFAULT_FILE_MODE
+            os.chmod(tmp_name, mode)
+        except OSError:
+            pass
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    atomic_write_bytes(path, text.encode(encoding))
 
 
 def safe_stem(path: Path) -> str:
@@ -1104,12 +1150,36 @@ def write_asset_manifest(assets_dir: Path, assets: list[Asset]) -> None:
     if not assets:
         return
     payload = {"files": [asset.output for asset in assets]}
-    (assets_dir / ASSET_MANIFEST_NAME).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(assets_dir / ASSET_MANIFEST_NAME, json.dumps(payload, ensure_ascii=False))
 
 
 def generated_asset_name(index: int, ext: str) -> str:
     ext = ext if ext.startswith(".") else f".{ext}"
     return f"image-{index:03d}{ext}"
+
+
+def sanitize_asset_extension(ext: str, source_name: str, warnings: list[WarningItem]) -> str:
+    """자산 파일 확장자를 허용 목록으로 검증한다.
+
+    허용 목록 밖의 확장자(.html, .exe, .js, .svg, .bat 등)는 실행·스크립트 위험이 있으므로
+    내용과 무관하게 .bin으로 바꾸고 경고를 남긴다.
+    """
+    normalized = ext.lower()
+    if normalized and not normalized.startswith("."):
+        normalized = f".{normalized}"
+    if normalized in SAFE_ASSET_EXTENSIONS:
+        return normalized
+    if normalized in {"", ".bin"}:
+        # 식별에 실패한 자산의 기본값이다. 이미 안전하므로 경고를 반복하지 않는다.
+        return ".bin"
+    warnings.append(
+        WarningItem(
+            "ASSET_EXTENSION_SANITIZED",
+            f"{source_name}: 허용되지 않은 자산 확장자({normalized or '없음'})를 '.bin'으로 저장했습니다.",
+            source_name,
+        )
+    )
+    return ".bin"
 
 
 def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode: str, warnings: list[WarningItem], clean_assets: bool = True) -> list[Asset]:
@@ -1148,9 +1218,9 @@ def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode:
             if png_data:
                 data = png_data
                 ext = ".png"
+        ext = sanitize_asset_extension(ext, ole_stream_name(stream), warnings)
         out_name = generated_asset_name(idx, ext)
-        out_path = assets_dir / out_name
-        out_path.write_bytes(data)
+        atomic_write_bytes(assets_dir / out_name, data)
         width, height = image_dimensions_from_bytes(data)
         assets.append(Asset(source=ole_stream_name(stream), output=out_name, kind="image", bytes=len(data), index=parse_bindata_index(source_name), width=width, height=height))
     write_asset_manifest(assets_dir, assets)
@@ -2039,8 +2109,9 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
                     if png_data:
                         data = png_data
                         ext = ".png"
+                ext = sanitize_asset_extension(ext, name, warnings)
                 out_name = generated_asset_name(idx, ext)
-                (assets_dir / out_name).write_bytes(data)
+                atomic_write_bytes(assets_dir / out_name, data)
                 width, height = image_dimensions_from_bytes(data)
                 assets.append(Asset(source=name, output=out_name, kind="image", bytes=len(data), index=parse_bindata_index(name), width=width, height=height))
             write_asset_manifest(assets_dir, assets)
@@ -2699,6 +2770,11 @@ def escape_table_cell(text: str) -> str:
 
 
 def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path], report_path: Optional[Path], options: ConvertOptions) -> ConvertResult:
+    """한 문서를 변환해 output_path/report_path에 원자적으로 씀다.
+
+    넘겨받은 경로에 그대로 쓴다(이미 있으면 덮어쓴다). 기존 산출물 보호는 호출자가
+    resolve_output_target()/unique_path()로 맡는다(CLI·GUI가 그렇게 한다).
+    """
     start = time.time()
     input_path = input_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
@@ -2736,12 +2812,12 @@ def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path]
         raise ConversionError(f"손상된 파일이거나 읽을 수 없는 구조입니다 ({type(exc).__name__}: {str(exc)[:120]})") from exc
 
     result.report["elapsedSeconds"] = round(time.time() - start, 3)
-    output_path.write_text(result.markdown, encoding="utf-8")
-    report_path.write_text(json.dumps(result.report, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(output_path, result.markdown)
+    atomic_write_text(report_path, json.dumps(result.report, ensure_ascii=False, indent=2))
     if options.dump_ir:
         ir_path = output_path.with_suffix(".ir.json")
         ir = [dataclasses.asdict(b) for b in result.blocks]
-        ir_path.write_text(json.dumps(ir, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(ir_path, json.dumps(ir, ensure_ascii=False, indent=2))
     if options.strict and (result.report.get("warnings") or result.report.get("losses")):
         raise ConversionError("strict 모드에서 warning/loss 항목이 발생했습니다. report.json을 확인하세요.")
     return result
@@ -2768,6 +2844,17 @@ def unique_path(path: Path) -> Path:
     raise ConversionError(f"출력 파일명 충돌을 해결할 수 없습니다: {path}")
 
 
+def resolve_output_target(output_path: Path, force: bool) -> tuple[Path, bool]:
+    """기존 산출물을 무단으로 덮어쓰지 않도록 최종 출력 경로를 정한다.
+
+    반환값은 (최종 경로, 이름이 바뀌었는지 여부). --force/--overwrite를 주지 않았는데
+    같은 이름의 파일이 있으면 GUI와 같은 규칙(unique_path)으로 `이름-2.md`를 쓴다.
+    """
+    if force or not output_path.exists():
+        return output_path, False
+    return unique_path(output_path), True
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="HWP/HWPX 문서를 Markdown과 assets/report 파일로 변환합니다.")
     parser.add_argument("input", nargs="?", help="입력 .hwp, .hwpx 또는 .hml(HWPML) 파일")
@@ -2783,6 +2870,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--no-clean-assets", action="store_true", help="재변환 시 기존 generated assets 정리를 건너뜁니다.")
     parser.add_argument("--report", help="변환 리포트 JSON 경로")
     parser.add_argument("--strict", action="store_true", help="손실/경고가 있으면 실패 처리")
+    parser.add_argument("--force", "--overwrite", dest="force", action="store_true", help="이미 있는 출력 .md 파일을 덮어씁니다. 기본값은 덮어쓰지 않고 이름-2.md로 저장")
     parser.add_argument("--batch", help="일괄 변환 glob 패턴. 예: \"samples/*.hwp\"")
     parser.add_argument("--dump-ir", action="store_true", help="개발자용 중간 IR JSON을 함께 출력")
     parser.add_argument("--version", action="version", version=f"hwp2md {VERSION}")
@@ -2813,7 +2901,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             for input_path in inputs:
                 try:
                     md_path = out_dir / f"{source_stem(input_path)}.md"
-                    assets_dir = Path(args.assets_dir) / source_stem(input_path) if args.assets_dir else out_dir / f"{md_path.stem}.assets"
+                    md_path, renamed = resolve_output_target(md_path, args.force)
+                    if renamed:
+                        print(f"NOTE {input_path.name}: 기존 파일을 덮어쓰지 않고 {md_path.name}로 저장합니다.")
+                    assets_dir = Path(args.assets_dir) / md_path.stem if args.assets_dir else out_dir / f"{md_path.stem}.assets"
                     report_path = md_path.with_suffix(".report.json") if not args.report else Path(args.report)
                     convert_file(input_path, md_path, assets_dir, report_path, options)
                     print(f"OK  {input_path} -> {md_path}")
@@ -2832,6 +2923,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not input_path.is_file():
             raise ConversionError(f"입력 파일을 찾을 수 없습니다: {input_path}")
         output_path = Path(args.output) if args.output else input_path.with_suffix(".md")
+        output_path, renamed = resolve_output_target(output_path, args.force)
+        if renamed:
+            print(f"NOTE 기존 파일을 덮어쓰지 않고 새 이름으로 저장합니다: {output_path}")
         assets_dir = Path(args.assets_dir) if args.assets_dir else None
         report_path = Path(args.report) if args.report else None
         result = convert_file(input_path, output_path, assets_dir, report_path, options)
