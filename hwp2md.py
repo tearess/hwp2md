@@ -11,6 +11,7 @@ import argparse
 import base64
 import binascii
 import dataclasses
+import errno
 import fnmatch
 import html
 import json
@@ -46,6 +47,10 @@ HWP_PARA_TEXT_TAG = 67
 HWP_CTRL_HEADER_TAG = 71
 HWP_TABLE_CELL_TAG = 72
 HWP_TABLE_TAG = 77
+# 그림 개체 레코드(0x55, SHAPE_COMPONENT_PICTURE)의 BinData 아이템 ID 위치.
+# 테두리·꼭짓점·자르기·안쪽 여백 뒤에 UINT16 bin_id가 온다(한글 5.x 저장 형식 기준).
+HWP_PICTURE_RECORD_TAG = 85
+HWP_PICTURE_BIN_OFFSET = 71
 HWP_TABLE_CTRL_ID = b" lbt"
 HWP_SHAPE_CTRL_ID = b" osg"
 HWP_EQUATION_RECORD_TAG = 88
@@ -116,6 +121,8 @@ class Block:
     path: str | None = None
     alt: str | None = None
     number: int | None = None
+    # image_anchor가 가리키는 자산. HWP는 "bin:<BinData 아이템 ID>", HWPX는 binaryItemIDRef 값.
+    target: str | None = None
 
 
 @dataclasses.dataclass
@@ -140,8 +147,46 @@ class ConvertResult:
     assets: list[Asset]
 
 
+@dataclasses.dataclass(frozen=True)
+class MarkdownProfile:
+    """--format 값에 따라 달라지는 Markdown 표현 방식."""
+
+    name: str
+    table_style: str  # "pipe": 파이프 표(셀 병합이 있으면 HTML), "html": 항상 HTML 표
+    image_link: str  # "markdown": ![](경로), "wiki": ![[경로]]
+    footnote_style: str  # "gfm": [^1] 각주, "numbered": [1] + 숫자 목록
+    inline_math: str  # "paren": \( ... \), "dollar": $ ... $
+    extra_frontmatter: bool  # Obsidian용 tags/aliases 추가
+
+
+MARKDOWN_PROFILES = {
+    "gfm": MarkdownProfile("gfm", "pipe", "markdown", "gfm", "paren", False),
+    "commonmark": MarkdownProfile("commonmark", "html", "markdown", "numbered", "paren", False),
+    "obsidian": MarkdownProfile("obsidian", "pipe", "wiki", "gfm", "dollar", True),
+}
+DEFAULT_MARKDOWN_FORMAT = "gfm"
+
+
+def markdown_profile(name: Optional[str]) -> MarkdownProfile:
+    key = (name or DEFAULT_MARKDOWN_FORMAT).strip().lower()
+    return MARKDOWN_PROFILES.get(key, MARKDOWN_PROFILES[DEFAULT_MARKDOWN_FORMAT])
+
+
 class ConversionError(Exception):
     """사용자에게 보여줄 수 있는 변환 오류."""
+
+
+class UsageError(ConversionError):
+    """인자나 대상이 잘못된 경우(종료 코드 1)."""
+
+
+class Hwp2MdArgumentParser(argparse.ArgumentParser):
+    """잘못된 인자는 종료 코드 1로 끝난다(변환 실패 2와 구분)."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"hwp2md 사용 오류: {message}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def unsupported_format_reason(head: bytes) -> Optional[str]:
@@ -157,20 +202,24 @@ def unsupported_format_reason(head: bytes) -> Optional[str]:
 
 
 def detect_format(path: Path) -> str:
-    with path.open("rb") as f:
-        head = f.read(32)
-    if not head:
-        raise ConversionError("빈 파일(0바이트)입니다. 내용이 없는 파일은 변환할 수 없습니다.")
-    suffix = path.suffix.lower()
-    if head.startswith(HWP_CFB_SIGNATURE):
-        return "hwp"
-    if zipfile.is_zipfile(path):
-        return "hwpx"
-    if head.lstrip(HWP_TEXT_LEAD_BYTES).startswith(b"<"):
-        # 법제처 등에서 내려받는 .hwp 중에는 한글 XML 형식(HWPML)으로 저장된 파일이 많다.
+    try:
         with path.open("rb") as f:
-            if b"<HWPML" in f.read(4096):
-                return "hwpml"
+            head = f.read(32)
+        if not head:
+            raise ConversionError("빈 파일(0바이트)입니다. 내용이 없는 파일은 변환할 수 없습니다.")
+        suffix = path.suffix.lower()
+        if head.startswith(HWP_CFB_SIGNATURE):
+            return "hwp"
+        if zipfile.is_zipfile(path):
+            return "hwpx"
+        if head.lstrip(HWP_TEXT_LEAD_BYTES).startswith(b"<"):
+            # 법제처 등에서 내려받는 .hwp 중에는 한글 XML 형식(HWPML)으로 저장된 파일이 많다.
+            with path.open("rb") as f:
+                if b"<HWPML" in f.read(4096):
+                    return "hwpml"
+    except OSError as exc:
+        # 권한 오류·경로 오류가 raw traceback으로 드러나지 않게 사용자 문구로 바꾼다.
+        raise ConversionError(input_read_error_message(path, exc)) from exc
     reason = unsupported_format_reason(head)
     if reason:
         raise ConversionError(reason)
@@ -183,8 +232,58 @@ def detect_format(path: Path) -> str:
     raise ConversionError(f"지원하지 않는 파일 형식입니다: {path}")
 
 
+def os_error_reason(exc: OSError) -> str:
+    """OSError를 사용자가 바로 알아볼 수 있는 짧은 이유로 바꿔 준다."""
+    if isinstance(exc, PermissionError):
+        return "읽기 또는 쓰기 권한이 없습니다"
+    if isinstance(exc, FileNotFoundError):
+        return "파일이나 폴더를 찾을 수 없습니다"
+    if isinstance(exc, IsADirectoryError):
+        return "폴더 경로가 지정되었습니다"
+    if isinstance(exc, NotADirectoryError):
+        return "경로의 일부가 폴더가 아닙니다"
+    errno_value = getattr(exc, "errno", None)
+    if errno_value == errno.ENOSPC:
+        return "저장 공간이 부족합니다"
+    if errno_value == errno.EROFS:
+        return "읽기 전용 위치입니다"
+    detail = getattr(exc, "strerror", None) or str(exc)
+    return (detail or exc.__class__.__name__).strip()
+
+
+def input_read_error_message(path: Path, exc: OSError) -> str:
+    return f"입력 파일을 읽을 수 없습니다: {path} ({os_error_reason(exc)}). 파일 위치와 읽기 권한을 확인하세요."
+
+
+def output_write_error_message(path: Path, exc: OSError) -> str:
+    return f"출력 파일을 쓸 수 없습니다: {path} ({os_error_reason(exc)}). 폴더 쓰기 권한과 남은 공간을 확인하세요."
+
+
+def write_text_file(path: Path, text: str) -> None:
+    try:
+        atomic_write_text(path, text)
+    except OSError as exc:
+        raise ConversionError(output_write_error_message(path, exc)) from exc
+
+
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_assets_dir(assets_dir: Path) -> None:
+    try:
+        assets_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConversionError(f"자산 폴더를 만들 수 없습니다: {assets_dir} ({os_error_reason(exc)}). 폴더 위치와 쓰기 권한을 확인하세요.") from exc
+
+
+def write_asset_bytes(assets_dir: Path, name: str, data: bytes) -> None:
+    target = assets_dir / name
+    try:
+        ensure_parent(target)
+        atomic_write_bytes(target, data)
+    except OSError as exc:
+        raise ConversionError(f"자산 파일을 쓸 수 없습니다: {target} ({os_error_reason(exc)}). 자산 폴더 쓰기 권한과 남은 공간을 확인하세요.") from exc
 
 
 def default_file_mode() -> int:
@@ -1116,7 +1215,16 @@ def add_hwp_control_warnings(
     if field_controls:
         warnings.append(WarningItem("HWP_FIELD_CONTROLS_IGNORED", f"HWP 필드 marker control은 본문에 보이는 텍스트를 우선 사용하고 marker 자체는 건너뛰었습니다: {control_count_summary(field_controls)}"))
 
-    handled = {HWP_SHAPE_CTRL_ID, *HWP_EQUATION_CTRL_IDS, *HWP_FOOTNOTE_CTRL_IDS, *HWP_LAYOUT_CTRL_IDS, *HWP_FIELD_CTRL_IDS}
+    handled = {
+        HWP_SHAPE_CTRL_ID,
+        *HWP_EQUATION_CTRL_IDS,
+        *HWP_FOOTNOTE_CTRL_IDS,
+        *HWP_LAYOUT_CTRL_IDS,
+        *HWP_FIELD_CTRL_IDS,
+        # 하이퍼링크(klh%)와 자동 번호(onta)는 본문 글자로 이미 복원한다.
+        HWP_HYPERLINK_CTRL_ID,
+        HWP_AUTO_NUMBER_CTRL_ID,
+    }
     unhandled = {key: value for key, value in non_table.items() if key not in handled}
     if unhandled:
         summary = control_count_summary(unhandled)
@@ -1150,7 +1258,10 @@ def write_asset_manifest(assets_dir: Path, assets: list[Asset]) -> None:
     if not assets:
         return
     payload = {"files": [asset.output for asset in assets]}
-    atomic_write_text(assets_dir / ASSET_MANIFEST_NAME, json.dumps(payload, ensure_ascii=False))
+    try:
+        atomic_write_text(assets_dir / ASSET_MANIFEST_NAME, json.dumps(payload, ensure_ascii=False))
+    except OSError as exc:
+        raise ConversionError(f"자산 목록 파일을 쓸 수 없습니다: {assets_dir / ASSET_MANIFEST_NAME} ({os_error_reason(exc)}).") from exc
 
 
 def generated_asset_name(index: int, ext: str) -> str:
@@ -1189,7 +1300,9 @@ def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode:
     bin_streams = [s for s in ole.listdir(streams=True, storages=False) if s and s[0] == "BinData"]
     if not bin_streams:
         return assets
-    assets_dir.mkdir(parents=True, exist_ok=True)
+    # 그림 개체가 가리키는 아이템 ID와 산출 파일 이름이 같은 순서가 되도록 BIN 번호로 정렬한다.
+    bin_streams.sort(key=lambda s: (parse_bindata_index(s[-1]) is None, parse_bindata_index(s[-1]) or 0, s[-1]))
+    ensure_assets_dir(assets_dir)
     stem = safe_stem(input_path)
     if clean_assets:
         removed = clean_generated_assets(assets_dir, stem)
@@ -1220,7 +1333,7 @@ def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode:
                 ext = ".png"
         ext = sanitize_asset_extension(ext, ole_stream_name(stream), warnings)
         out_name = generated_asset_name(idx, ext)
-        atomic_write_bytes(assets_dir / out_name, data)
+        write_asset_bytes(assets_dir, out_name, data)
         width, height = image_dimensions_from_bytes(data)
         assets.append(Asset(source=ole_stream_name(stream), output=out_name, kind="image", bytes=len(data), index=parse_bindata_index(source_name), width=width, height=height))
     write_asset_manifest(assets_dir, assets)
@@ -1313,8 +1426,7 @@ def bmp_to_png(data: bytes) -> Optional[bytes]:
 
 
 def append_image_anchor_if_caption(blocks: list[Block]) -> bool:
-    # 마지막 본문 블록만 필요하므로 뒤에서부터 찾는다(전체 목록을 복사하면 도형이 많은 문서에서 제곱 시간이 걸린다).
-    last = next((block for block in reversed(blocks) if block.type not in NON_CONTENT_BLOCK_TYPES), None)
+    last = last_content_block(blocks)
     if last is None:
         return False
     if last.type == "image_anchor":
@@ -1323,6 +1435,39 @@ def append_image_anchor_if_caption(blocks: list[Block]) -> bool:
         blocks.append(Block(type="image_anchor", text=last.text, alt=last.text))
         return True
     return False
+
+
+def last_content_block(blocks: list[Block]) -> Optional[Block]:
+    # 마지막 본문 블록만 필요하므로 뒤에서부터 찾는다(전체 목록을 복사하면 도형이 많은 문서에서 제곱 시간이 걸린다).
+    return next((block for block in reversed(blocks) if block.type not in NON_CONTENT_BLOCK_TYPES), None)
+
+
+def parse_hwp_picture_bin_id(payload: bytes) -> Optional[int]:
+    """그림 개체 레코드(0x55)에서 BinData 아이템 ID를 읽는다.
+
+    레이아웃은 테두리 선·꼭짓점·자르기·안쪽 여백 뒤 offset 71의 UINT16이다.
+    """
+    if len(payload) < HWP_PICTURE_BIN_OFFSET + 2:
+        return None
+    bin_id = struct.unpack_from("<H", payload, HWP_PICTURE_BIN_OFFSET)[0]
+    return bin_id or None
+
+
+def hwp_shape_picture_bin_ids(records: list[tuple[int, int, bytes]], start_idx: int) -> list[int]:
+    """gso control에 속한 그림 개체들의 BinData 아이템 ID를 문서 순서대로 모은다."""
+    if start_idx >= len(records):
+        return []
+    control_level = records[start_idx][1]
+    found: list[int] = []
+    for tag, level, payload in records[start_idx + 1 :]:
+        if level <= control_level:
+            break
+        if tag != HWP_PICTURE_RECORD_TAG:
+            continue
+        bin_id = parse_hwp_picture_bin_id(payload)
+        if bin_id is not None:
+            found.append(bin_id)
+    return found
 
 
 def extract_hwp_equation(records: list[tuple[int, int, bytes]], start_idx: int) -> Optional[str]:
@@ -1657,6 +1802,7 @@ class AssetPlacementSummary:
     control: int = 0
     caption: int = 0
     approximated: int = 0
+    excluded: int = 0
 
 
 def next_unplaced_inline_asset(inline_assets: list[Asset], placed_assets: set[str], start_index: int) -> tuple[Optional[Asset], int]:
@@ -1670,19 +1816,81 @@ def next_unplaced_inline_asset(inline_assets: list[Asset], placed_assets: set[st
     return asset, index + 1
 
 
-def summarize_asset_placements(assets: list[Asset], blocks: list[Block], assets_dir: Path) -> AssetPlacementSummary:
-    if not assets:
-        return AssetPlacementSummary()
-    visible_blocks = content_blocks(blocks)
-    inline_assets = select_inline_assets(assets, assets_dir)
-    inline_asset_index = 0
-    placed_assets: set[str] = set()
-    summary = AssetPlacementSummary()
+def anchor_target_matches(asset: Asset, target: str) -> bool:
+    """image_anchor가 가리키는 자산인지 확인한다.
+
+    HWP는 추출한 자산에 BinData 아이템 ID를 남기고("bin:3"), HWPX는 section의
+    binaryItemIDRef 값(image1 등)과 BinData 파일 이름이 같다.
+    """
+    target = target.strip()
+    if not target:
+        return False
+    if target.startswith("bin:"):
+        try:
+            wanted = int(target[4:])
+        except ValueError:
+            return False
+        return asset.index == wanted
+    return Path(asset.source).stem.strip().lower() == target.lower()
+
+
+@dataclasses.dataclass
+class AssetPlacementPlan:
+    """본문 블록마다 어떤 자산을 놓을지 미리 정한 결과."""
+
+    anchored: dict[int, Asset] = dataclasses.field(default_factory=dict)
+    captioned: dict[int, Asset] = dataclasses.field(default_factory=dict)
+    placed: set[str] = dataclasses.field(default_factory=set)
+    approximated: int = 0
+
+
+def plan_asset_placements(visible_blocks: list[Block], inline_assets: list[Asset], all_assets: Optional[list[Asset]] = None) -> AssetPlacementPlan:
+    """그림 control 위치를 우선 쓰고, 위치를 모르는 그림만 캡션 순서로 채운다.
+
+    target이 있는 앵커는 그 자산을 그 자리에서 쓴다(같은 그림이 여러 번 나오면 모두 그린다).
+    target 자산이 본문 배치 대상에서 빠진 작은 그림이면 다른 그림을 끌어오지 않고 건너뛴다.
+    """
+    plan = AssetPlacementPlan()
+    if not visible_blocks or not inline_assets:
+        return plan
+    all_assets = all_assets if all_assets is not None else inline_assets
+    inline_names = {asset.output for asset in inline_assets}
+    # 가리켜진 자산은 순서 배치 대상에서 빼 둔다(캡션이 남의 그림을 먼저 가져가지 않게).
+    reserved: set[str] = set()
+    for block in visible_blocks:
+        if block.type == "image_anchor" and block.target:
+            match = next((asset for asset in all_assets if anchor_target_matches(asset, block.target)), None)
+            if match is not None and match.output in inline_names:
+                reserved.add(match.output)
+    index = 0
+    placed = plan.placed
+
+    def take_next() -> Optional[Asset]:
+        nonlocal index
+        while index < len(inline_assets) and (inline_assets[index].output in placed or inline_assets[index].output in reserved):
+            index += 1
+        if index >= len(inline_assets):
+            return None
+        asset = inline_assets[index]
+        index += 1
+        placed.add(asset.output)
+        return asset
+
     for idx, block in enumerate(visible_blocks):
         if block.type == "image_anchor":
-            asset, inline_asset_index = next_unplaced_inline_asset(inline_assets, placed_assets, inline_asset_index)
-            if asset:
-                summary.control += 1
+            asset = None
+            if block.target:
+                match = next((candidate for candidate in all_assets if anchor_target_matches(candidate, block.target)), None)
+                if match is not None:
+                    if match.output not in inline_names:
+                        # 본문 배치에서 빠진 작은 그림이면 자리만 비워 두고 다른 그림으로 대체하지 않는다.
+                        continue
+                    asset = match
+            else:
+                asset = take_next()
+            if asset is not None:
+                plan.anchored[idx] = asset
+                placed.add(asset.output)
             continue
         if (
             block.text
@@ -1690,26 +1898,42 @@ def summarize_asset_placements(assets: list[Asset], blocks: list[Block], assets_
             and not caption_is_for_following_image_anchor(visible_blocks, idx)
             and not caption_is_for_following_table(visible_blocks, idx)
         ):
-            asset, inline_asset_index = next_unplaced_inline_asset(inline_assets, placed_assets, inline_asset_index)
-            if asset:
-                summary.caption += 1
-    summary.approximated = max(0, len(assets) - len(placed_assets))
-    return summary
+            asset = take_next()
+            if asset is not None:
+                plan.captioned[idx] = asset
+    plan.approximated = max(0, len(inline_assets) - len(placed))
+    return plan
 
 
-def add_asset_position_warnings(assets: list[Asset], blocks: list[Block], assets_dir: Path, warnings: list[WarningItem], losses: list[LossItem]) -> None:
+def summarize_asset_placements(assets: list[Asset], blocks: list[Block], assets_dir: Path) -> AssetPlacementSummary:
+    if not assets:
+        return AssetPlacementSummary()
+    inline_assets = select_inline_assets(assets, assets_dir)
+    plan = plan_asset_placements(content_blocks(blocks), inline_assets, assets)
+    return AssetPlacementSummary(
+        control=len(plan.anchored),
+        caption=len(plan.captioned),
+        approximated=plan.approximated,
+        excluded=max(0, len(assets) - len(inline_assets)),
+    )
+
+
+def add_asset_position_warnings(assets: list[Asset], blocks: list[Block], assets_dir: Path, warnings: list[WarningItem], losses: list[LossItem], source_label: str = "HWP") -> None:
     if not assets:
         return
     summary = summarize_asset_placements(assets, blocks, assets_dir)
     anchored = summary.control
     approximated = summary.approximated
     if anchored:
-        warnings.append(WarningItem("ASSET_POSITION_FROM_CONTROL", f"HWP 그림 control 위치를 기준으로 이미지 {anchored}개를 본문에 배치했습니다."))
+        warnings.append(WarningItem("ASSET_POSITION_FROM_CONTROL", f"{source_label} 그림 control 위치를 기준으로 그림 {anchored}곳을 본문에 배치했습니다."))
     if summary.caption:
         warnings.append(WarningItem("ASSET_POSITION_FROM_CAPTION", f"\ucea1\uc158\uc744 \uae30\uc900\uc73c\ub85c \uc774\ubbf8\uc9c0 {summary.caption}\uac1c\ub97c \ubcf8\ubb38\uc5d0 \ubc30\uce58\ud588\uc2b5\ub2c8\ub2e4."))
     if approximated:
-        warnings.append(WarningItem("ASSET_POSITION_APPROXIMATED", f"HWP 이미지 {approximated}개는 정확한 본문 위치를 확정하지 못해 캡션 추정 또는 첨부 목록으로 보존했습니다."))
+        warnings.append(WarningItem("ASSET_POSITION_APPROXIMATED", f"{source_label} 이미지 {approximated}개는 정확한 본문 위치를 확정하지 못해 캡션 추정 또는 첨부 목록으로 보존했습니다."))
         losses.append(LossItem("ASSET_INLINE_POSITION_APPROXIMATED", approximated))
+    if summary.excluded:
+        # 작은 장식·서명·로고나 그림이 아닌 첨부는 처음부터 본문 배치 대상이 아니다.
+        warnings.append(WarningItem("ASSET_EXCLUDED_FROM_BODY", f"{source_label} 작은 그림·장식·그림이 아닌 첨부 {summary.excluded}개는 본문에 넣지 않고 첨부 목록으로 보존했습니다."))
 
 
 def add_page_artifact_warnings(blocks: list[Block], warnings: list[WarningItem], losses: list[LossItem]) -> None:
@@ -1759,6 +1983,12 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
         sections.sort(key=lambda s: int(re.sub(r"\D+", "", s[1]) or "0"))
         if not sections:
             raise ConversionError(f"{body_storage}/Section 스트림을 찾을 수 없습니다.")
+        # 그림 개체가 가리키는 BinData 아이템 ID를 실제 스트림 목록과 대조해 엉뚱한 번호를 믿지 않는다.
+        bin_ids = {
+            index
+            for index in (parse_bindata_index(stream[-1]) for stream in ole.listdir(streams=True, storages=False) if stream and stream[0] == "BinData")
+            if index is not None
+        }
 
         para_count = 0
         record_count = 0
@@ -1798,7 +2028,19 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                             idx = next_idx
                             continue
                     if control_id == HWP_SHAPE_CTRL_ID and options.image_mode != "skip":
-                        append_image_anchor_if_caption(blocks)
+                        # 그림 개체 레코드의 BinData ID를 읽어 그림을 원래 문단 자리에 놓는다.
+                        anchored = 0
+                        for bin_id in hwp_shape_picture_bin_ids(records, idx):
+                            if bin_ids and bin_id not in bin_ids:
+                                continue
+                            caption_block = last_content_block(blocks)
+                            caption = None
+                            if caption_block is not None and caption_block.type != "image_anchor" and caption_block.text and is_figure_caption_text(caption_block.text):
+                                caption = caption_block.text
+                            blocks.append(Block(type="image_anchor", text=caption, alt=caption, target=f"bin:{bin_id}"))
+                            anchored += 1
+                        if not anchored:
+                            append_image_anchor_if_caption(blocks)
                     elif control_id in HWP_EQUATION_CTRL_IDS and options.equation_mode != "skip":
                         equation = extract_hwp_equation(records, idx)
                         blocks.append(Block(type="equation", text=equation or r"\text{HWP equation}"))
@@ -1857,6 +2099,7 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
 
         losses.append(LossItem("LAYOUT_DROPPED", 1))
         losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
+        normalize_heading_structure(blocks)
         add_page_artifact_warnings(blocks, warnings, losses)
         if repeated_header_footer:
             warnings.append(WarningItem(
@@ -1984,6 +2227,15 @@ def parse_explicit_heading(text: str) -> Optional[tuple[int, str]]:
     stripped = text.strip()
     if not stripped:
         return None
+    # "제 목: …" 표지와 "보도자료" 머리말은 제목임이 명시된 경우다. 이때만 H1으로 올린다.
+    # HWP 본문은 공백이 하나로 줄어 "제 목 제목내용"처럼 콜론 없이 붙기도 한다(다만 "제 목적"은 다른 말이다).
+    title_match = re.match(r"^제\s*목\s*[:：]?\s*(?P<body>.+)$", stripped)
+    if title_match and not re.match(r"^제\s*목\s*(?:적|표|차|록)", stripped):
+        return 1, title_match.group("body").strip()
+    if re.fullmatch(r"보\s*도\s*자\s*료", stripped):
+        return 1, "보도자료"
+    if re.fullmatch(r"별\s*지\s*\d*", stripped):
+        return 2, stripped
     attach_match = re.match(r"^【\s*붙임\s*】\s*(?P<body>.+)$", stripped)
     if attach_match:
         return 2, attach_match.group("body").strip()
@@ -2014,13 +2266,50 @@ def is_short_heading_phrase(text: str) -> bool:
     return len(stripped.split()) <= 7
 
 
+NUMBERED_ENTRY_RE = re.compile(r"^(?P<num>\d{1,2})[.)]\s+(?P<body>\S.*)$")
+LEGAL_ARTICLE_RE = re.compile(r"^제\s*\d+\s*조")
+LETTERHEAD_LABEL_RE = re.compile(
+    r"(전\s*화|팩스|팩시밀리|TEL|FAX|E-?mail|홈페이지|우편번호|문서번호|시행일?자|접수일?자|등록번호|발신|수신|참조|담당자|연락처)",
+    re.I,
+)
+DATE_ONLY_RE = re.compile(r"^[\d\s.년월일월화수목금토일/,()~-]+$")
+ORGANIZATION_LINE_RE = re.compile(r"^.{2,20}(?:공사|공단|법인|주식회사|㈜|\(주\)|청|연구원|위원회|센터|사무소)$")
+# "서울 서초구 서초중앙로26길17 동신빌딩(서초동) 3층"처럼 주소가 첫 줄에 오는 레터헤드
+ADDRESS_LINE_RE = re.compile(r"^\S+\s+\S*(?:구|군)\s*\S*(?:로|길)\s*\d")
+
+
+def is_letterhead_or_metadata_line(text: str) -> bool:
+    """레터헤드·발신일·문서번호처럼 제목이 아닌 머리말 줄인지 판단한다.
+
+    문서 첫 줄을 무조건 H1으로 올리면 "2026. 11." 같은 발신 연월나 "전 화 : …"
+    같은 연락처 줄이 제목이 되고, 정작 "제 목: …" 제목은 H2로 밀린다.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if DATE_ONLY_RE.fullmatch(stripped) and re.search(r"\d", stripped):
+        return True
+    if LETTERHEAD_LABEL_RE.search(stripped):
+        return True
+    if re.match(r"^[^:：]{1,10}\s*[:：]", stripped):
+        # "의뢰번호 : 2026-11", "수 신 : …"처럼 이름표가 붙은 머리말
+        return True
+    if ORGANIZATION_LINE_RE.fullmatch(stripped):
+        return True
+    if ADDRESS_LINE_RE.search(stripped):
+        return True
+    if re.fullmatch(r"[\d\s()+.-]{7,}", stripped):
+        return True
+    return False
+
+
 def infer_heading_level(text: str, policy: str, is_first: bool = False) -> Optional[int]:
     if policy == "none":
         return None
     stripped = text.strip()
     if not stripped:
         return None
-    if is_first and len(stripped) <= 80 and not stripped.isdigit():
+    if is_first and len(stripped) <= 80 and not stripped.isdigit() and not is_letterhead_or_metadata_line(stripped) and not LEGAL_ARTICLE_RE.match(stripped):
         return 1
     if re.match(r"^(제\s*\d+\s*[장절관항]|제\s*[一二三四五六七八九十]+\s*[장절관항])\b", stripped) and len(stripped) <= 60:
         return 2
@@ -2040,6 +2329,72 @@ def infer_heading_level(text: str, policy: str, is_first: bool = False) -> Optio
             if re.search(r"(보고|계획|검토|회의|현황|경위|근거|의견|총괄|요구사항|질의|회신|안내|지침|공문|제목)$", stripped):
                 return 2
     return None
+
+
+def numbered_entry_number(block: Block) -> Optional[int]:
+    if block.type == "ordered_list" and block.number is not None:
+        # list_match로 이미 목록이 된 항목은 글자에서 번호를 뗐으므로 number를 쓴다.
+        return block.number
+    if block.type not in {"heading", "paragraph"} or not block.text:
+        return None
+    match = NUMBERED_ENTRY_RE.match(block.text.strip())
+    if not match:
+        return None
+    return int(match.group("num"))
+
+
+def demote_to_ordered_item(block: Block, number: int) -> None:
+    match = NUMBERED_ENTRY_RE.match((block.text or "").strip())
+    body = match.group("body").strip() if match else (block.text or "").strip()
+    block.type = "ordered_list"
+    block.level = None
+    block.number = number
+    block.text = body
+
+
+def normalize_numbered_runs(blocks: list[Block]) -> int:
+    """이어지는 '1.', '2.', '3.' 줄을 하나의 번호 목록으로 되돌린다.
+
+    법령 각 호(條項의 各號)가 줄마다 따로 블록이 되면서 첫 항목만 짧다는 이유로
+    `##` 제목이 되고 나머지는 본문으로 남아 위계가 뒤집히는 문제를 바로잡는다.
+    본문 문단으로 끊긴 번호(섹션 제목 1. → 본문 → 2.)는 목록이 아니므로 건드리지 않는다.
+    """
+    visible = [block for block in blocks if block.type not in NON_CONTENT_BLOCK_TYPES]
+    numbers = [numbered_entry_number(block) for block in visible]
+    converted = 0
+    pos = 0
+    while pos < len(visible):
+        if numbers[pos] is None:
+            pos += 1
+            continue
+        end = pos
+        while end + 1 < len(visible) and numbers[end + 1] is not None and numbers[end + 1] == numbers[end] + 1:
+            end += 1
+        if end > pos:
+            for idx in range(pos, end + 1):
+                demote_to_ordered_item(visible[idx], numbers[idx] or 0)
+                converted += 1
+        pos = end + 1
+    return converted
+
+
+def normalize_legal_numbered_headings(blocks: list[Block]) -> int:
+    """법령 조문 인용 바로 뒤의 '1.' 하나만 제목이 된 경우도 목록 항목으로 되돌린다."""
+    visible = [block for block in blocks if block.type not in NON_CONTENT_BLOCK_TYPES]
+    converted = 0
+    for idx, block in enumerate(visible):
+        if block.type != "heading" or numbered_entry_number(block) != 1:
+            continue
+        previous = visible[idx - 1] if idx > 0 else None
+        if previous is not None and previous.type == "paragraph" and LEGAL_ARTICLE_RE.match((previous.text or "").strip()):
+            demote_to_ordered_item(block, 1)
+            converted += 1
+    return converted
+
+
+def normalize_heading_structure(blocks: list[Block]) -> None:
+    normalize_numbered_runs(blocks)
+    normalize_legal_numbered_headings(blocks)
 
 
 def parse_table_like_text(text: str) -> Optional[list[list[str]]]:
@@ -2086,7 +2441,7 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
         if options.image_mode != "skip":
             bin_names = [n for n in names if n.lower().startswith("bindata/") and not n.endswith("/")]
             if bin_names:
-                assets_dir.mkdir(parents=True, exist_ok=True)
+                ensure_assets_dir(assets_dir)
             stem = safe_stem(input_path)
             if bin_names and options.clean_assets:
                 removed = clean_generated_assets(assets_dir, stem)
@@ -2111,17 +2466,18 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
                         ext = ".png"
                 ext = sanitize_asset_extension(ext, name, warnings)
                 out_name = generated_asset_name(idx, ext)
-                atomic_write_bytes(assets_dir / out_name, data)
+                write_asset_bytes(assets_dir, out_name, data)
                 width, height = image_dimensions_from_bytes(data)
                 assets.append(Asset(source=name, output=out_name, kind="image", bytes=len(data), index=parse_bindata_index(name), width=width, height=height))
             write_asset_manifest(assets_dir, assets)
             if assets:
-                warnings.append(WarningItem("ASSET_POSITION_APPROXIMATED", "HWPX 이미지의 본문 내 배치 위치를 완전히 해석하지 못한 항목은 첨부 목록으로 보존합니다."))
+                add_asset_position_warnings(assets, blocks, assets_dir, warnings, losses, source_label="HWPX")
 
     if not blocks:
         warnings.append(WarningItem("NO_TEXT_BLOCKS", "추출된 텍스트 블록이 없습니다."))
     losses.append(LossItem("LAYOUT_DROPPED", 1))
     losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
+    normalize_heading_structure(blocks)
     report = build_report(input_path, "hwpx", blocks, assets, warnings, losses)
     markdown = render_markdown(input_path, blocks, assets, report, options, output_path, assets_dir)
     return ConvertResult(markdown=markdown, report=report, blocks=blocks, assets=assets)
@@ -2191,7 +2547,7 @@ def convert_hwpml(input_path: Path, output_path: Path, assets_dir: Path, options
         formats = {item.get("BinData"): item.get("Format", "") for item in root.iter("BINITEM")}
         bin_items = [b for b in root.iter("BINDATA") if (b.text or "").strip()]
         if bin_items:
-            assets_dir.mkdir(parents=True, exist_ok=True)
+            ensure_assets_dir(assets_dir)
             if options.clean_assets:
                 removed = clean_generated_assets(assets_dir, safe_stem(input_path))
                 if removed:
@@ -2222,19 +2578,20 @@ def convert_hwpml(input_path: Path, output_path: Path, assets_dir: Path, options
                     data = png_data
                     ext = ".png"
             out_name = generated_asset_name(idx, ext)
-            (assets_dir / out_name).write_bytes(data)
+            write_asset_bytes(assets_dir, out_name, data)
             width, height = image_dimensions_from_bytes(data)
             index = int(item.get("Id")) if (item.get("Id") or "").isdigit() else None
             assets.append(Asset(source=source, output=out_name, kind="image", bytes=len(data), index=index, width=width, height=height))
         if bin_items:
             write_asset_manifest(assets_dir, assets)
         if assets:
-            warnings.append(WarningItem("ASSET_POSITION_APPROXIMATED", "HWPML 이미지의 본문 내 배치 위치를 해석하지 못해 첨부 목록으로 보존합니다."))
+            add_asset_position_warnings(assets, blocks, assets_dir, warnings, losses, source_label="HWPML")
 
     if not blocks:
         warnings.append(WarningItem("NO_TEXT_BLOCKS", "추출된 텍스트 블록이 없습니다."))
     losses.append(LossItem("LAYOUT_DROPPED", 1))
     losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
+    normalize_heading_structure(blocks)
     report = build_report(input_path, "hwpml", blocks, assets, warnings, losses)
     markdown = render_markdown(input_path, blocks, assets, report, options, output_path, assets_dir)
     return ConvertResult(markdown=markdown, report=report, blocks=blocks, assets=assets)
@@ -2263,6 +2620,9 @@ def collect_text(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
 
 def collect_text_with_inline_styles(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
     name = local_name(elem)
+    if name == "shapeComment":
+        # 그림 설명(원본 파일명·크기·촬영일 등)은 본문 글자가 아니다.
+        return ""
     if name in {"lineBreak", "br"}:
         return "\n"
     if name == "tab":
@@ -2390,25 +2750,47 @@ def hwpx_table_blocks(table: ET.Element, blocks: list[Block], heading_policy: st
     return finalize_table_blocks(rows, cols, cells, caption_lines, heading_policy, has_content_blocks(blocks), include_page_artifacts)
 
 
+def hwpx_picture_refs(elem: ET.Element, skip: Optional[set[int]] = None) -> list[str]:
+    """elem 아래에서 표 밖에 있는 그림의 binaryItemIDRef를 문서 순서대로 모은다."""
+    refs: list[str] = []
+    for child in list(elem):
+        if skip and id(child) in skip:
+            continue
+        name = local_name(child)
+        if name in HWPX_TABLE_NAMES:
+            continue
+        if name == "pic":
+            ref = next((node.get("binaryItemIDRef") for node in child.iter() if local_name(node) == "img"), None)
+            if ref and ref.strip():
+                refs.append(ref.strip())
+            continue
+        refs.extend(hwpx_picture_refs(child, skip))
+    return refs
+
+
 def walk_hwpx_blocks(elem: ET.Element, blocks: list[Block], heading_policy: str, include_page_artifacts: bool = False) -> None:
     name = local_name(elem)
     if name in HWPX_TABLE_NAMES:
         blocks.extend(hwpx_table_blocks(elem, blocks, heading_policy, include_page_artifacts))
         return
+    if name == "pic":
+        ref = next((node.get("binaryItemIDRef") for node in elem.iter() if local_name(node) == "img"), None)
+        if ref and ref.strip():
+            blocks.append(Block(type="image_anchor", target=ref.strip()))
+        return
     if name == "p":
         # HWPX는 표가 문단(p > run > tbl) 안에 들어 있다. 표를 뺀 문단 텍스트를 먼저 내고 표는 따로 복원한다.
         nested_tables = hwpx_top_level_tables(elem)
-        if nested_tables:
-            text = collect_text(elem, {id(t) for t in nested_tables})
-            for part in split_text_to_candidate_blocks(text):
-                append_text_block(blocks, part, heading_policy, include_page_artifacts=include_page_artifacts)
-            for table in nested_tables:
-                blocks.extend(hwpx_table_blocks(table, blocks, heading_policy, include_page_artifacts))
-            return
-        text = collect_text(elem)
+        skip = {id(table) for table in nested_tables}
+        text = collect_text(elem, skip) if nested_tables else collect_text(elem)
         if text:
             for part in split_text_to_candidate_blocks(text):
                 append_text_block(blocks, part, heading_policy, include_page_artifacts=include_page_artifacts)
+        # 그림은 문단 글자 뒤에 원래 자리대로 넣는다.
+        for ref in hwpx_picture_refs(elem, skip):
+            blocks.append(Block(type="image_anchor", target=ref))
+        for table in nested_tables:
+            blocks.extend(hwpx_table_blocks(table, blocks, heading_policy, include_page_artifacts))
         return
     for child in list(elem):
         walk_hwpx_blocks(child, blocks, heading_policy, include_page_artifacts)
@@ -2460,13 +2842,13 @@ def build_report(input_path: Path, fmt: str, blocks: list[Block], assets: list[A
 def render_markdown(input_path: Path, blocks: list[Block], assets: list[Asset], report: dict[str, Any], options: ConvertOptions, output_path: Path, assets_dir: Path) -> str:
     lines: list[str] = []
     visible_blocks = content_blocks(blocks)
+    profile = markdown_profile(options.markdown_format)
     if options.frontmatter == "yaml":
-        lines.extend(render_frontmatter(input_path, report, len(visible_blocks), len(assets)))
+        lines.extend(render_frontmatter(input_path, report, len(visible_blocks), len(assets), profile, visible_blocks))
 
     rel_assets_dir = os.path.relpath(assets_dir, output_path.parent).replace(os.sep, "/") if assets else ""
     inline_assets = select_inline_assets(assets, assets_dir)
-    inline_asset_index = 0
-    placed_assets: set[str] = set()
+    placement = plan_asset_placements(visible_blocks, inline_assets, assets)
     last_list_type: Optional[str] = None
     ordered_index = 1
     footnotes: list[str] = []
@@ -2491,7 +2873,7 @@ def render_markdown(input_path: Path, blocks: list[Block], assets: list[Asset], 
             ordered_index += 1
             last_list_type = block.type
         elif block.type == "table" and block.rows:
-            lines.extend(render_table(block.rows, options.table_mode, block.cells))
+            lines.extend(render_table(block.rows, options.table_mode, block.cells, profile.table_style))
             lines.append("")
             last_list_type = None
         elif block.type == "image" and block.path:
@@ -2499,9 +2881,9 @@ def render_markdown(input_path: Path, blocks: list[Block], assets: list[Asset], 
             lines.append("")
             last_list_type = None
         elif block.type == "image_anchor":
-            asset, inline_asset_index = next_unplaced_inline_asset(inline_assets, placed_assets, inline_asset_index)
+            asset = placement.anchored.get(idx)
             if asset:
-                lines.append(render_asset_markdown(asset, rel_assets_dir, alt=block.alt or block.text))
+                lines.append(render_asset_markdown(asset, rel_assets_dir, alt=block.alt or block.text, profile=profile))
                 lines.append("")
             last_list_type = None
         elif block.type == "equation":
@@ -2510,46 +2892,44 @@ def render_markdown(input_path: Path, blocks: list[Block], assets: list[Asset], 
             last_list_type = None
         elif block.type == "footnote":
             footnotes.append(block.text or "HWP 각주 내용은 원본 문서에 있습니다.")
-            lines.append(f"[^{len(footnotes)}]")
+            marker = f"[^{len(footnotes)}]" if profile.footnote_style == "gfm" else f"[{len(footnotes)}]"
+            lines.append(marker)
             lines.append("")
             last_list_type = None
 
-        if (
-            block.type != "image_anchor"
-            and
-            block.text
-            and inline_asset_index < len(inline_assets)
-            and is_figure_caption_text(block.text)
-            and not caption_is_for_following_image_anchor(visible_blocks, idx)
-            and not caption_is_for_following_table(visible_blocks, idx)
-        ):
-            asset, inline_asset_index = next_unplaced_inline_asset(inline_assets, placed_assets, inline_asset_index)
-            if asset:
-                lines.append(render_asset_markdown(asset, rel_assets_dir, alt=block.text))
-                lines.append("")
+        asset = placement.captioned.get(idx)
+        if asset is not None:
+            lines.append(render_asset_markdown(asset, rel_assets_dir, alt=block.text, profile=profile))
+            lines.append("")
 
     if assets and options.image_mode != "skip":
-        remaining_assets = [asset for asset in assets if asset.output not in placed_assets]
+        remaining_assets = [asset for asset in assets if asset.output not in placement.placed]
         if remaining_assets:
             lines.append("## 첨부 자산")
             lines.append("")
             for asset in remaining_assets:
-                lines.append(render_asset_markdown(asset, rel_assets_dir))
+                lines.append(render_asset_markdown(asset, rel_assets_dir, profile=profile))
                 lines.append("")
 
     if footnotes:
         lines.append("## 각주")
         lines.append("")
         for idx, footnote in enumerate(footnotes, start=1):
-            lines.append(f"[^{idx}]: {escape_md_text(footnote)}")
+            if profile.footnote_style == "gfm":
+                lines.append(f"[^{idx}]: {escape_md_text(footnote)}")
+            else:
+                lines.append(f"{idx}. {escape_md_text(footnote)}")
         lines.append("")
 
     md = "\n".join(lines).strip() + "\n"
     md = re.sub(r"\n{4,}", "\n\n\n", md)
+    if profile.inline_math == "dollar":
+        # Obsidian은 \( \) 대신 $ ... $를 수식으로 읽는다.
+        md = re.sub(r"\\\((.+?)\\\)", lambda m: f"${m.group(1)}$", md)
     return md
 
 
-def render_frontmatter(input_path: Path, report: dict[str, Any], block_count: int, asset_count: int) -> list[str]:
+def render_frontmatter(input_path: Path, report: dict[str, Any], block_count: int, asset_count: int, profile: Optional[MarkdownProfile] = None, blocks: Optional[list[Block]] = None) -> list[str]:
     lines = [
         "---",
         f"source: {json.dumps(str(input_path), ensure_ascii=False)}",
@@ -2558,6 +2938,16 @@ def render_frontmatter(input_path: Path, report: dict[str, Any], block_count: in
         f"blocks: {block_count}",
         f"assets: {asset_count}",
     ]
+    if profile is not None and profile.extra_frontmatter:
+        # Obsidian은 tags로 문서를 묶고 aliases로 문서를 다른 이름으로도 찾는다.
+        lines.append(f"markdown_format: {profile.name}")
+        lines.append("tags:")
+        lines.append("  - hwp2md")
+        lines.append(f"  - {report['format']}")
+        title = next((block.text.strip() for block in (blocks or []) if block.type == "heading" and block.level == 1 and block.text), None)
+        if title:
+            lines.append("aliases:")
+            lines.append(f"  - {json.dumps(title, ensure_ascii=False)}")
     metadata = report.get("metadata") or {}
     if metadata:
         lines.append("metadata:")
@@ -2567,11 +2957,15 @@ def render_frontmatter(input_path: Path, report: dict[str, Any], block_count: in
     return lines
 
 
-def render_asset_markdown(asset: Asset, rel_assets_dir: str, alt: Optional[str] = None) -> str:
+def render_asset_markdown(asset: Asset, rel_assets_dir: str, alt: Optional[str] = None, profile: Optional[MarkdownProfile] = None) -> str:
     rel = f"{rel_assets_dir}/{asset.output}" if rel_assets_dir and rel_assets_dir != "." else asset.output
     suffix = Path(asset.output).suffix.lower()
     label = escape_md_text(alt or Path(asset.output).stem)
-    if asset.kind == "image" and suffix in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}:
+    is_image = asset.kind == "image" and suffix in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+    if is_image and profile is not None and profile.image_link == "wiki":
+        # Obsidian은 볼트 안 경로를 위키 링크로 바로 임베드한다.
+        return f"![[{rel}]]"
+    if is_image:
         return f"![{label}]({markdown_link_destination(rel)})"
     return f"- [{escape_md_text(asset.output)}]({markdown_link_destination(rel)})"
 
@@ -2680,13 +3074,13 @@ def caption_is_for_following_image_anchor(blocks: list[Block], idx: int) -> bool
     return False
 
 
-def render_table(rows: list[list[str]], table_mode: str, cells: Optional[list[TableCell]] = None) -> list[str]:
+def render_table(rows: list[list[str]], table_mode: str, cells: Optional[list[TableCell]] = None, table_style: str = "pipe") -> list[str]:
     max_cols = max((len(r) for r in rows), default=0)
     if max_cols == 0:
         return []
     norm = [(r + [""] * max_cols)[:max_cols] for r in rows]
     has_spans = bool(cells and any(cell.rowspan > 1 or cell.colspan > 1 for cell in cells))
-    if table_mode == "html" or (table_mode == "hybrid" and has_spans):
+    if table_style == "html" or table_mode == "html" or (table_mode == "hybrid" and has_spans):
         return render_html_table(norm, cells)
     norm = drop_empty_table_columns(norm)
     norm = [row for row in norm if any(cell.strip() for cell in row)]
@@ -2787,8 +3181,14 @@ def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path]
     else:
         report_path = report_path.expanduser().resolve()
 
-    ensure_parent(output_path)
-    ensure_parent(report_path)
+    try:
+        ensure_parent(output_path)
+    except OSError as exc:
+        raise ConversionError(output_write_error_message(output_path, exc)) from exc
+    try:
+        ensure_parent(report_path)
+    except OSError as exc:
+        raise ConversionError(output_write_error_message(report_path, exc)) from exc
     fmt = detect_format(input_path)
     try:
         if fmt == "hwp":
@@ -2806,18 +3206,18 @@ def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path]
         # 코드 자체의 버그(TypeError 등)는 가리지 않도록 데이터 손상에서 나오는 예외만 잡는다.
         raise ConversionError(f"손상된 파일이거나 읽을 수 없는 구조입니다 ({type(exc).__name__}: {str(exc)[:120]})") from exc
     except OSError as exc:
-        # olefile의 OleFileError/NotOleFileError는 OSError 하위 클래스다. 그 외 파일 입출력 오류는 그대로 둔다.
+        # olefile의 OleFileError/NotOleFileError는 OSError 하위 클래스다. 그 외는 파일 읽기 오류(권한·경로)다.
         if not type(exc).__module__.startswith("olefile"):
-            raise
+            raise ConversionError(input_read_error_message(input_path, exc)) from exc
         raise ConversionError(f"손상된 파일이거나 읽을 수 없는 구조입니다 ({type(exc).__name__}: {str(exc)[:120]})") from exc
 
     result.report["elapsedSeconds"] = round(time.time() - start, 3)
-    atomic_write_text(output_path, result.markdown)
-    atomic_write_text(report_path, json.dumps(result.report, ensure_ascii=False, indent=2))
+    write_text_file(output_path, result.markdown)
+    write_text_file(report_path, json.dumps(result.report, ensure_ascii=False, indent=2))
     if options.dump_ir:
         ir_path = output_path.with_suffix(".ir.json")
         ir = [dataclasses.asdict(b) for b in result.blocks]
-        atomic_write_text(ir_path, json.dumps(ir, ensure_ascii=False, indent=2))
+        write_text_file(ir_path, json.dumps(ir, ensure_ascii=False, indent=2))
     if options.strict and (result.report.get("warnings") or result.report.get("losses")):
         raise ConversionError("strict 모드에서 warning/loss 항목이 발생했습니다. report.json을 확인하세요.")
     return result
@@ -2855,12 +3255,28 @@ def resolve_output_target(output_path: Path, force: bool) -> tuple[Path, bool]:
     return unique_path(output_path), True
 
 
+def write_batch_summary(path: Path, documents: list[dict[str, Any]], ok: int, failed: int) -> None:
+    """배치 한 번의 결과를 문서별 요약으로 묶어 남긴다."""
+    payload = {
+        "converter": f"hwp2md {VERSION}",
+        "batch": {"documents": len(documents), "ok": ok, "failed": failed},
+        "documents": documents,
+    }
+    write_text_file(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="HWP/HWPX 문서를 Markdown과 assets/report 파일로 변환합니다.")
+    parser = Hwp2MdArgumentParser(
+        description="HWP/HWPX 문서를 Markdown과 assets/report 파일로 변환합니다.",
+        epilog=(
+            "종료 코드: 0 성공, 1 사용 오류(인자·대상 없음, 배치 일부 실패), "
+            "2 변환 실패(손상·암호화·읽기/쓰기 오류), 130 사용자 중단"
+        ),
+    )
     parser.add_argument("input", nargs="?", help="입력 .hwp, .hwpx 또는 .hml(HWPML) 파일")
     parser.add_argument("-o", "--output", help="출력 Markdown 경로")
     parser.add_argument("--assets-dir", help="이미지/첨부 자산 폴더")
-    parser.add_argument("--format", choices=["gfm", "commonmark", "obsidian"], default="gfm", help="Markdown 출력 방언")
+    parser.add_argument("--format", choices=["gfm", "commonmark", "obsidian"], default="gfm", help="Markdown 출력 방언. gfm: 파이프 표·[^1] 각주(기본), commonmark: 항상 HTML 표·숫자 각주, obsidian: ![[이미지]] 임베드·$수식$·tags/aliases")
     parser.add_argument("--heading-policy", choices=["style", "outline", "font", "none"], default="font", help="제목 추론 정책")
     parser.add_argument("--table-mode", choices=["gfm", "html", "hybrid"], default="hybrid", help="표 출력 방식")
     parser.add_argument("--image-mode", choices=["extract", "embed", "skip"], default="extract", help="이미지 처리 방식. embed는 현재 extract와 동일하게 동작")
@@ -2868,7 +3284,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--frontmatter", choices=["none", "yaml"], default="yaml", help="YAML frontmatter 출력 여부")
     parser.add_argument("--include-page-artifacts", action="store_true", help="머리말/꼬리말 등 페이지 부속 정보를 가능한 경우 포함")
     parser.add_argument("--no-clean-assets", action="store_true", help="재변환 시 기존 generated assets 정리를 건너뜁니다.")
-    parser.add_argument("--report", help="변환 리포트 JSON 경로")
+    parser.add_argument("--report", help="변환 리포트 JSON 경로. --batch와 함께 주면 문서별 리포트는 각 문서 옆에 남기고 이 경로에는 배치 전체 요약을 씁니다.")
     parser.add_argument("--strict", action="store_true", help="손실/경고가 있으면 실패 처리")
     parser.add_argument("--force", "--overwrite", dest="force", action="store_true", help="이미 있는 출력 .md 파일을 덮어씁니다. 기본값은 덮어쓰지 않고 이름-2.md로 저장")
     parser.add_argument("--batch", help="일괄 변환 glob 패턴. 예: \"samples/*.hwp\"")
@@ -2893,35 +3309,59 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.batch:
             inputs = expand_batch(args.batch)
             if not inputs:
-                raise ConversionError(f"batch 패턴에 매칭되는 파일이 없습니다: {args.batch}")
-            out_dir = Path(args.output) if args.output else Path.cwd() / "converted"
-            out_dir.mkdir(parents=True, exist_ok=True)
+                raise UsageError(f"batch 패턴에 매칭되는 파일이 없습니다: {args.batch}")
+            try:
+                out_dir = Path(args.output) if args.output else Path.cwd() / "converted"
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ConversionError(f"출력 폴더를 만들 수 없습니다: {out_dir} ({os_error_reason(exc)}). 폴더 위치와 쓰기 권한을 확인하세요.") from exc
             ok = 0
             failed = 0
+            documents: list[dict[str, Any]] = []
             for input_path in inputs:
+                record: dict[str, Any] = {"source": str(input_path)}
                 try:
                     md_path = out_dir / f"{source_stem(input_path)}.md"
                     md_path, renamed = resolve_output_target(md_path, args.force)
                     if renamed:
                         print(f"NOTE {input_path.name}: 기존 파일을 덮어쓰지 않고 {md_path.name}로 저장합니다.")
                     assets_dir = Path(args.assets_dir) / md_path.stem if args.assets_dir else out_dir / f"{md_path.stem}.assets"
-                    report_path = md_path.with_suffix(".report.json") if not args.report else Path(args.report)
-                    convert_file(input_path, md_path, assets_dir, report_path, options)
+                    # 문서별 리포트는 항상 각 문서 옆에 남긴다(배치에서 공유 경로를 쓰면 서로 덮어쓴다).
+                    report_path = md_path.with_suffix(".report.json")
+                    result = convert_file(input_path, md_path, assets_dir, report_path, options)
                     print(f"OK  {input_path} -> {md_path}")
                     ok += 1
+                    record.update(
+                        {
+                            "ok": True,
+                            "markdown": str(md_path),
+                            "report": str(report_path),
+                            "blocks": result.report.get("blocks"),
+                            "assets": result.report.get("assets"),
+                            "warnings": [item.get("code") for item in result.report.get("warnings", [])],
+                            "losses": result.report.get("losses", []),
+                            "elapsedSeconds": result.report.get("elapsedSeconds"),
+                        }
+                    )
                 except Exception as exc:
                     print(f"FAIL {input_path}: {exc}", file=sys.stderr)
                     failed += 1
+                    record.update({"ok": False, "error": str(exc)})
+                documents.append(record)
+            if args.report:
+                write_batch_summary(Path(args.report), documents, ok, failed)
             print(f"batch done: ok={ok}, failed={failed}")
+            if args.report:
+                print(f"Batch report: {args.report}")
             return 1 if failed else 0
 
         if not args.input:
             parser.error("input 파일 또는 --batch 패턴이 필요합니다.")
         input_path = Path(args.input)
         if input_path.is_dir():
-            raise ConversionError(f"폴더는 직접 변환할 수 없습니다. --batch \"{input_path}/*.hwp\" 형식을 사용하세요.")
+            raise UsageError(f"폴더는 직접 변환할 수 없습니다. --batch \"{input_path}/*.hwp\" 형식을 사용하세요.")
         if not input_path.is_file():
-            raise ConversionError(f"입력 파일을 찾을 수 없습니다: {input_path}")
+            raise UsageError(f"입력 파일을 찾을 수 없습니다: {input_path}")
         output_path = Path(args.output) if args.output else input_path.with_suffix(".md")
         output_path, renamed = resolve_output_target(output_path, args.force)
         if renamed:
@@ -2936,8 +3376,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         if result.report.get("warnings"):
             print(f"Warnings: {len(result.report['warnings'])}개 - report.json을 확인하세요.")
         return 0
+    except UsageError as exc:
+        print(f"hwp2md 사용 오류: {exc}", file=sys.stderr)
+        return 1
     except ConversionError as exc:
         print(f"hwp2md 오류: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        # 여기까지 올라온 파일 오류도 traceback 대신 한 줄로 알린다.
+        location = getattr(exc, "filename", "") or ""
+        print(f"hwp2md 오류: 파일을 읽거나 쓸 수 없습니다 ({os_error_reason(exc)}){' - ' + str(location) if location else ''}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("사용자 중단", file=sys.stderr)
