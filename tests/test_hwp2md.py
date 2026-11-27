@@ -7,7 +7,6 @@ from xml.etree import ElementTree as ET
 
 import hwp2md
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_170508 = ROOT / "170508(조간) 16년말 외국인이 보유한 국내 토지는 233제곱키로미터 전 국토의 0.2퍼센트(토지정책과).hwp"
 
@@ -440,7 +439,7 @@ class Hwp2MdSampleTests(unittest.TestCase):
     def test_170508_sample_restores_values_and_metadata(self) -> None:
         try:
             import olefile  # noqa: F401
-        except Exception:
+        except ImportError:
             self.skipTest("olefile is not installed")
 
         result = hwp2md.convert_hwp(

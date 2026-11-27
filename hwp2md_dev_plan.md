@@ -1,5 +1,7 @@
 # HWP/HWPX to Markdown 변환기 개발계획서
 
+> **역사 문서입니다.** 이 문서는 v0.1.0(2026-05-11) 설계 시점의 계획을 그대로 남긴 것입니다. 현재 동작·옵션·한계는 [`README.md`](README.md)와 [`devlog_hwp2md.md`](devlog_hwp2md.md)를 기준으로 보세요. 이후 바뀐 내용(예: `--format` 실제 반영, `--source-path`, 패키징)은 이 문서에 반영하지 않았습니다.
+
 작성일: 2026-05-11  
 대상 산출물: `.hwp` 또는 `.hwpx` 문서를 자연스러운 Markdown 문서와 첨부 자산 폴더로 변환하는 CLI/라이브러리
 

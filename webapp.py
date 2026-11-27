@@ -10,7 +10,9 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
+import traceback
 import uuid
 import zipfile
 from email.parser import BytesParser
@@ -23,7 +25,6 @@ from urllib.parse import quote, urlparse
 
 import hwp2md
 
-
 LOCAL_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 VERCEL_MAX_UPLOAD_BYTES = 4 * 1024 * 1024
 MAX_UPLOAD_BYTES = int(
@@ -33,6 +34,12 @@ MAX_UPLOAD_BYTES = int(
     )
 )
 SUPPORTED_SUFFIXES = {".hwp", ".hwpx", ".hml"}
+# 요청 한 건이 연결을 붙잡는 시간과, 동시에 돌릴 변환 수를 제한한다.
+REQUEST_TIMEOUT_SECONDS = int(os.environ.get("HWP2MD_REQUEST_TIMEOUT", "60") or "60")
+MAX_CONCURRENT_CONVERSIONS = max(1, int(os.environ.get("HWP2MD_MAX_CONCURRENCY", "4") or "4"))
+CONVERSION_SLOTS = threading.Semaphore(MAX_CONCURRENT_CONVERSIONS)
+# zip에 담아 돌려줘도 되는 확장자. 자산 추출 단계에서도 거르지만 마지막에 한 번 더 확인한다.
+ZIP_SAFE_SUFFIXES = set(hwp2md.SAFE_ASSET_EXTENSIONS) | {".md", ".json", ".bin"}
 APP_ROOT = Path(__file__).resolve().parent
 APP_TMP_ROOT = Path(
     os.environ.get(
@@ -106,7 +113,7 @@ def build_options(fields: dict[str, list[str]]) -> hwp2md.ConvertOptions:
 def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, list[str]], list[UploadedFile]]:
     if "multipart/form-data" not in content_type.lower():
         raise ValueError("multipart/form-data 요청만 처리할 수 있습니다.")
-    raw_message = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+    raw_message = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + body
     message = BytesParser(policy=default).parsebytes(raw_message)
     fields: dict[str, list[str]] = {}
     files: list[UploadedFile] = []
@@ -451,21 +458,31 @@ def html_page(message: str | None = None, message_kind: str = "error") -> bytes:
   </script>
 </body>
 </html>
-""".encode("utf-8")
+""".encode()
 
 
 def write_zip(output_root: Path, summary: list[dict[str, Any]]) -> bytes:
+    """변환 산출물을 zip으로 묶다. 실행·스크립트 확장자는 한 번 더 걸러 담지 않는다."""
     buffer = io.BytesIO()
+    excluded: list[str] = []
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
         for path in sorted(output_root.rglob("*")):
-            if path.is_file():
-                archive.write(path, path.relative_to(output_root).as_posix())
+            if not path.is_file():
+                continue
+            relative = path.relative_to(output_root).as_posix()
+            if path.suffix.lower() not in ZIP_SAFE_SUFFIXES:
+                excluded.append(relative)
+                continue
+            archive.write(path, relative)
+        payload = {"converter": f"hwp2md {hwp2md.VERSION}", "documents": summary, "excludedFiles": excluded}
+        archive.writestr("summary.json", json.dumps(payload, ensure_ascii=False, indent=2))
     return buffer.getvalue()
 
 
 class Hwp2MdRequestHandler(BaseHTTPRequestHandler):
-    server_version = "hwp2md-web/0.1"
+    server_version = f"hwp2md-web/{hwp2md.VERSION}"
+    # 연결을 무한정 붙잡는 요청(느린 업로드·멈춘 클라이언트)을 스스로 끊기 위한 소켓 타임아웃.
+    timeout = REQUEST_TIMEOUT_SECONDS
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -488,16 +505,34 @@ class Hwp2MdRequestHandler(BaseHTTPRequestHandler):
             self.send_html(html_page(str(exc)), status=HTTPStatus.BAD_REQUEST)
         except ValueError as exc:
             self.send_html(html_page(str(exc)), status=HTTPStatus.BAD_REQUEST)
-        except Exception as exc:
-            self.send_html(html_page(f"변환 중 오류가 발생했습니다: {exc}"), status=HTTPStatus.INTERNAL_SERVER_ERROR)
+        except Exception:  # noqa: BLE001
+            # 내부 예외 문자열(경로·스택 정보)은 응답에 넣지 않고 서버 로그에만 남긴다.
+            traceback.print_exc()
+            self.send_html(
+                html_page("변환 중 내부 오류가 발생했습니다. 서버 로그를 확인한 뒤 다시 시도해 주세요."),
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def handle_convert(self) -> None:
+        # 동시 변환 수를 제한한다. 자리가 없으면 대기시키지 않고 바로 알린다.
+        if not CONVERSION_SLOTS.acquire(blocking=False):
+            self.send_html(
+                html_page("지금 다른 변환이 처리 중입니다. 잠시 후 다시 시도해 주세요."),
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        try:
+            self.convert_uploaded_documents()
+        finally:
+            CONVERSION_SLOTS.release()
+
+    def convert_uploaded_documents(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0") or "0")
         if content_length <= 0:
             raise ValueError("업로드된 파일이 없습니다.")
         if content_length > MAX_UPLOAD_BYTES:
             max_upload_mb = max(1, MAX_UPLOAD_BYTES // (1024 * 1024))
-            raise ValueError(f"File is too large. Upload up to {max_upload_mb}MB at a time.")
+            raise ValueError(f"업로드 크기가 한도({max_upload_mb}MB)를 넘습니다. 파일 수를 줄이거나 나눠서 올려 주세요.")
 
         body = self.rfile.read(content_length)
         fields, uploaded_files = parse_multipart_form(self.headers.get("Content-Type", ""), body)
