@@ -10,8 +10,9 @@ HWP/HWPX 문서를 Markdown 초안으로 바꾸는 오프라인 변환기 `hwp2m
 | 최신 릴리스 | [v0.2.0](https://github.com/tearess/hwp2md/releases/tag/v0.2.0) (10/23) |
 | 입력 형식 | HWP 5.x(배포용 문서 포함), HWPX, HWPML(`.hml`, 확장자만 `.hwp`인 XML) |
 | 사용 형태 | CLI, tkinter GUI, Windows 실행 파일, 로컬 웹앱, Vercel 배포 구성 |
+| 라이선스 | MIT (`LICENSE`, Copyright (c) 2026 tearess) |
 | 마지막 코드 커밋 | `chore/p2-polish-packaging-and-docs` (PR #3, `hwp2md.py` 3,4xx줄) |
-| 단위 테스트 | 197개 통과 (`python -m unittest`, 7개 건너뜀 — tkinter 없는 환경 6개, 표본 `.hwp` 필요 1개) |
+| 단위 테스트 | 203개 통과 (`python -m unittest`, 7개 건너뜀 — tkinter 없는 환경 6개, 표본 `.hwp` 필요 1개) |
 | 시험한 문서 | 로컬 5,646개, 공개 샘플 6,332개, NAS 466개 ([4절](#4-시험-결과-누적)) |
 | 먼저 고칠 문제 | v0.2.0 릴리스의 실행 파일은 버전을 `0.1.0`으로 표시합니다. 소스는 고쳤고 다음 빌드부터 반영됩니다 ([7절](#7-남은-문제)) |
 
@@ -238,6 +239,17 @@ HWP/HWPX 문서를 Markdown 초안으로 바꾸는 오프라인 변환기 `hwp2m
 - **CI**: `.github/workflows/ci.yml`을 더해 Python 3.10~3.12에서 `unittest`와 `ruff check`를 돌리고, 빌드한 wheel로 `hwp2md`/`python -m hwp2md`까지 확인합니다. 연결된 GitHub App에 `workflows` 권한이 없어 이 파일은 저장소에 직접 push할 수 없었습니다. 전문은 `downloads/hwp2md_ci_workflow_2026-11-27/ci.yml`에 저장했고 PR 본문에도 실었으니, 저장소에 넣을 때는 워크플로 편집 권한이 있는 계정으로 파일을 추가하면 됩니다.
 - **시험**: 합성 HWP·압축 스트림·잘린 스트림·크기 한도·배치 패턴·웹앱 오류 응답 시험 34개를 더해 163 → 197개가 되었습니다.
 
+### 11/28 (3단계 마무리) — MIT 라이선스와 배포용 문서 이용 안내
+
+PR #3에 남겨 둔 사용자 결정 두 건(P1-10, P1-11)을 반영했습니다. 복호화 동작과 CLI 플래그 구조는 바꾸지 않고 표기와 안내만 정리했습니다.
+
+- **라이선스 MIT 확정**(P1-10): 루트 `LICENSE`에 MIT 전문과 `Copyright (c) 2026 tearess (https://github.com/tearess)`를 넣었습니다. `pdf2md`의 `NOTICE`와 같은 저작자 표기입니다.
+- **패키지 메타데이터**: `pyproject.toml`에 `license = "MIT"`, `license-files = ["LICENSE"]`(PEP 639)를 넣고 빌드 요구를 `setuptools>=77`로 올렸습니다. 만든 wheel의 `METADATA`에 `License-Expression: MIT`, `License-File: LICENSE`가 들어가고 `dist-info/licenses/LICENSE`가 동봉되는 것을 확인했습니다. `License ::` 분류기는 SPDX 식과 겹치므로 넣지 않았습니다.
+- **README**: 「라이선스 및 고지」를 MIT 기준으로 다시 썼습니다(재배포 시 고지 유지, 의존성 `olefile`(BSD), 한컴 비제휴, 결과 검수). 「배포용 문서(복사·인쇄 제한) 변환 안내」 절을 새로 두어 적법한 열람·변환 권한이 있는 문서에만 쓸 것, 권한 없는 제한 우회·재배포에 쓸 수 없다는 것, 실행과 결과 사용의 책임은 사용자에게 있다는 것, 암호 문서는 풀지 않는다는 것, `DISTRIBUTION_DOC_DECRYPTED` 리포트를 남기는 것을 적었습니다.
+- **CLI `--help`**: description에 같은 이용 범위 안내를, epilog에 라이선스(MIT)와 비제휴 고지를 넣고 `RawDescriptionHelpFormatter`로 줄바꿈을 유지했습니다. `--allow-distribution-doc` 같은 런타임 플래그는 만들지 않았습니다(현행 기능 유지).
+- **시험**: `tests/test_packaging_notices.py` 6개를 더해 197 → 203개. `LICENSE`·`pyproject.toml`·README 표기 일치와 `--help` 문구를 고정합니다.
+- **검증**: `python -m unittest discover -s tests` **203개 통과(0 errors / 0 failures, skip 7)**, `ruff check .` **0건**, `pip wheel` → `hwp2md-0.2.0-py3-none-any.whl` 생성 후 venv 설치에서 `hwp2md --version`(`hwp2md 0.2.0`)과 `--help` 문구를 확인했습니다.
+
 ## 4. 시험 결과 누적
 
 ### 로컬 문서
@@ -277,7 +289,7 @@ PC에서 찾은 파일은 중복 제외 8,026개입니다. 당시 지원 형식 
 
 ### 단위 테스트 수 변화
 
-23 → 26 → 31 → 38 → 40 → 46 → 47 → 53 → 60 → 62 → 65 → 70 → 71 → 74 → 76 → 80 → 86 → 94 → 100 → 103 → 106 → 115 → 122 → 132 → 163
+23 → 26 → 31 → 38 → 40 → 46 → 47 → 53 → 60 → 62 → 65 → 70 → 71 → 74 → 76 → 80 → 86 → 94 → 100 → 103 → 106 → 115 → 122 → 132 → 163 → 197 → 203
 
 ## 5. 알게 된 기술 사항
 

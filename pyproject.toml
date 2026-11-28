@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=61"]
+# PEP 639(SPDX license 식) 메타데이터를 쓰므로 setuptools 77 이상이 필요하다.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +8,8 @@ name = "hwp2md"
 dynamic = ["version"]
 description = "HWP/HWPX 문서를 Markdown 초안으로 변환하는 도구"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["olefile>=0.47"]
 keywords = ["hwp", "hwpx", "markdown", "converter", "hancom"]

@@ -3426,11 +3426,22 @@ def warn_about_noop_options(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = Hwp2MdArgumentParser(
-        description="HWP/HWPX 문서를 Markdown과 assets/report 파일로 변환합니다.",
-        epilog=(
-            "종료 코드: 0 성공, 1 사용 오류(인자·대상 없음, 배치 일부 실패), "
-            "2 변환 실패(손상·암호화·읽기/쓰기 오류), 130 사용자 중단"
+        description=(
+            "HWP/HWPX 문서를 Markdown과 assets/report 파일로 변환합니다.\n"
+            "\n"
+            "배포용 문서(복사·인쇄 제한)의 본문도 변환하지만, 이 기능은 적법하게 열람·변환할\n"
+            "권한이 있는 문서에만 사용하세요. 권한 없는 문서의 제한 우회나 작성자가 허용하지\n"
+            "않은 재배포에는 쓸 수 없고, 사용에 따른 책임은 사용자에게 있습니다. 자세한 내용은\n"
+            "README의 「배포용 문서(복사·인쇄 제한) 변환 안내」를 보세요."
         ),
+        epilog=(
+            "종료 코드: 0 성공, 1 사용 오류(인자·대상 없음, 배치 일부 실패),\n"
+            "          2 변환 실패(손상·암호화·읽기/쓰기 오류), 130 사용자 중단\n"
+            "라이선스: MIT — Copyright (c) 2026 tearess (LICENSE 파일 참고)\n"
+            "한글과컴퓨터와 제휴·후원·승인 관계가 없는 독립 도구입니다."
+        ),
+        # 안내 문구의 줄바꿈을 도움말에서 그대로 보여 준다.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("input", nargs="?", help="입력 .hwp, .hwpx 또는 .hml(HWPML) 파일")
     parser.add_argument("-o", "--output", help="출력 Markdown 경로")
