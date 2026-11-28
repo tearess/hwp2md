@@ -1,0 +1,55 @@
+[build-system]
+# PEP 639(SPDX license 식) 메타데이터를 쓰므로 setuptools 77 이상이 필요하다.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hwp2md"
+dynamic = ["version"]
+description = "HWP/HWPX 문서를 Markdown 초안으로 변환하는 도구"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["olefile>=0.47"]
+keywords = ["hwp", "hwpx", "markdown", "converter", "hancom"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Environment :: Console",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+hwp2md = "hwp2md:main"
+
+[tool.setuptools]
+# hwp2md.py 하나가 변환기 본체이고, webapp/GUI는 같은 폴더의 보조 실행 파일이다.
+py-modules = ["hwp2md", "webapp", "hwp2md_gui"]
+
+[tool.setuptools.dynamic]
+# 버전은 hwp2md.VERSION 한 곳에서만 관리한다.
+version = { attr = "hwp2md.VERSION" }
+
+[tool.ruff]
+line-length = 200
+target-version = "py310"
+exclude = ["sample_output", "webapp_tmp", ".test_tmp"]
+
+[tool.ruff.lint]
+# 기본 규칙(E4/E7/E9/F)에 import 정렬, 최신 문법, 예외 처리 위생, 보안 검사를 더한다.
+# 줄 길이는 위 line-length로만 다루고 E501(포맷팅 노이즈)은 켜지 않는다.
+select = ["E4", "E7", "E9", "F", "I", "UP", "BLE", "S", "SIM"]
+ignore = [
+    # subprocess는 GUI에서 결과 폴더를 여는 용도로만 쓰고 인자를 리스트로 넘긴다(셸 미사용).
+    "S603",
+    "S606",
+    # "open"/"xdg-open"은 OS 기본 실행 파일이라 절대 경로를 고정할 수 없다.
+    "S607",
+    # XML은 표준 ElementTree로 읽는다. 외부 엔티티를 해석하지 않고 expat 증폭 한도가 폭탄을 막는다.
+    "S314",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]

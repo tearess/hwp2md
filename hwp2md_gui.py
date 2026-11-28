@@ -9,14 +9,13 @@ import queue
 import subprocess
 import sys
 import threading
-import traceback
-from pathlib import Path
-
 import tkinter as tk
+import traceback
+from collections.abc import Iterable
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import hwp2md
-
 
 APP_ROOT = Path(__file__).resolve().parent
 SUPPORTED_SUFFIXES = {".hwp", ".hwpx", ".hml"}
@@ -182,7 +181,8 @@ class Hwp2MdGui:
         iterator = root.rglob("*") if self.recursive.get() else root.iterdir()
         self.add_paths(path for path in iterator if path.is_file())
 
-    def add_paths(self, paths: object) -> None:
+    def add_paths(self, paths: Iterable[str | Path]) -> None:
+        """파일·폴더 경로를 목록에 더한다. 지원하지 않는 확장자는 조용히 건너뛴다."""
         added = 0
         skipped = 0
         for raw_path in paths:
@@ -238,7 +238,7 @@ class Hwp2MdGui:
                 subprocess.Popen(["open", str(path)])
             else:
                 subprocess.Popen(["xdg-open", str(path)])
-        except Exception as exc:
+        except (OSError, subprocess.SubprocessError, AttributeError) as exc:
             messagebox.showerror("결과 폴더 열기 실패", str(exc))
 
     def start_conversion(self) -> None:
@@ -273,7 +273,7 @@ class Hwp2MdGui:
         failed = 0
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
+        except OSError as exc:
             self.events.put(("fatal", f"결과 폴더를 만들 수 없습니다: {exc}"))
             return
 
@@ -293,7 +293,8 @@ class Hwp2MdGui:
                     )
                 )
                 ok += 1
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
+                # 한 파일의 예상 밖 오류로 나머지 파일 변환을 멈추지 않고 기록만 남긴다.
                 failed += 1
                 detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
                 self.events.put(("log", f"FAIL {input_path.name}: {detail}"))

@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
 from unittest import mock
 
 import hwp2md
@@ -12,7 +11,7 @@ try:
     import hwp2md_gui
 except (ImportError, OSError) as exc:  # tkinter가 없는 헤드리스·서버 환경에서는 GUI 모듈을 쓸 수 없다(보통 libtk 누락 ImportError).
     hwp2md_gui = None  # type: ignore[assignment]
-    GUI_IMPORT_ERROR: Optional[str] = f"{type(exc).__name__}: {exc}"
+    GUI_IMPORT_ERROR: str | None = f"{type(exc).__name__}: {exc}"
 else:
     GUI_IMPORT_ERROR = None
 

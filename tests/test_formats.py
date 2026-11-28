@@ -1,18 +1,15 @@
+import contextlib
+import io
 import struct
 import tempfile
 import unittest
 import zipfile
 import zlib
-from typing import Optional
+from pathlib import Path
 from unittest import mock
 from xml.etree import ElementTree as ET
-from pathlib import Path
-
-import contextlib
-import io
 
 import hwp2md
-
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (16).to_bytes(4, "big") + (16).to_bytes(4, "big") + b"\x08\x02\x00\x00\x00"
 
@@ -500,7 +497,7 @@ class EncryptedHwpxTests(unittest.TestCase):
 
 class NumberedSentenceHeadingTests(unittest.TestCase):
     # 아래 문장은 실제 기준·규정 문서에서 가져왔다.
-    def level(self, text: str) -> Optional[int]:
+    def level(self, text: str) -> int | None:
         return hwp2md.infer_heading_level(text, "font")
 
     def test_numbered_clause_sentence_is_not_heading(self) -> None:

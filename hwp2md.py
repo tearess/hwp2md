@@ -10,25 +10,28 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
 import dataclasses
 import errno
-import fnmatch
+import glob
 import html
 import json
 import os
 import re
-import shutil
 import struct
 import sys
 import tempfile
 import time
 import zipfile
 import zlib
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any
 from xml.etree import ElementTree as ET
 
 VERSION = "0.2.0"
+# 패키지 메타데이터(pyproject.toml)도 이 값을 단일 출처로 읽는다.
+__version__ = VERSION
 ASSET_MANIFEST_NAME = ".hwp2md-assets.json"
 # 문서에 심어진 BinData 이름의 확장자를 그대로 믿으면 .html/.exe 같은 파일이 사용자 폴더에 생긴다.
 # 그림으로 열어도 실행되지 않는 포맷만 허용하고, 나머지는 .bin으로 저장한다.
@@ -133,6 +136,7 @@ class ConvertOptions:
     image_mode: str = "extract"
     equation_mode: str = "latex"
     frontmatter: str = "yaml"
+    source_path: str = "rel"
     include_page_artifacts: bool = False
     clean_assets: bool = True
     strict: bool = False
@@ -167,7 +171,7 @@ MARKDOWN_PROFILES = {
 DEFAULT_MARKDOWN_FORMAT = "gfm"
 
 
-def markdown_profile(name: Optional[str]) -> MarkdownProfile:
+def markdown_profile(name: str | None) -> MarkdownProfile:
     key = (name or DEFAULT_MARKDOWN_FORMAT).strip().lower()
     return MARKDOWN_PROFILES.get(key, MARKDOWN_PROFILES[DEFAULT_MARKDOWN_FORMAT])
 
@@ -189,7 +193,7 @@ class Hwp2MdArgumentParser(argparse.ArgumentParser):
         raise SystemExit(1)
 
 
-def unsupported_format_reason(head: bytes) -> Optional[str]:
+def unsupported_format_reason(head: bytes) -> str | None:
     """OLE/ZIP이 아닌 파일의 헤더를 보고 변환할 수 없는 이유를 알려준다."""
     if head.startswith(b"HWP Document File"):
         return "HWP 3.0(한글 97 이전) 형식이라 지원하지 않습니다. 한글에서 열어 .hwp(5.x) 또는 .hwpx로 다시 저장한 뒤 변환하세요."
@@ -297,6 +301,39 @@ def default_file_mode() -> int:
 DEFAULT_FILE_MODE = default_file_mode()
 
 
+def relative_or_absolute(target: Path, start: Path) -> str:
+    """상대 경로를 만들되, Windows에서 다른 드라이브면 절대 경로를 돌려준다.
+
+    os.path.relpath는 드라이브가 다르면 ValueError를 던진다. 링크에 쓰는 경로는
+    그대로 쓸 수 있어야 하므로 이때는 file:// 없이도 읽히는 절대 경로를 쓴다.
+    """
+    try:
+        return os.path.relpath(target, start).replace(os.sep, "/")
+    except ValueError:
+        return target.resolve().as_posix()
+
+
+def source_display_path(input_path: Path, output_path: Path | None, mode: str) -> str:
+    """frontmatter에 적을 원본 경로.
+
+    rel(기본)은 출력 폴더 기준 상대 경로를 쓰되, 출력 폴더 밖으로 나가면 파일명만 적는다.
+    결과물을 공유해도 다른 로컬 폴더 구조가 드러나지 않게 하기 위해서다.
+    """
+    if mode == "none":
+        return ""
+    if mode == "abs":
+        return str(input_path)
+    start = output_path.parent if output_path is not None else Path.cwd()
+    try:
+        rel = os.path.relpath(input_path, start)
+    except ValueError:
+        # 다른 드라이브면 상대 경로를 만들 수 없으니 파일명만 쓴다.
+        return input_path.name
+    if rel.startswith(".."):
+        return input_path.name
+    return rel.replace(os.sep, "/")
+
+
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """같은 폴더의 임시 파일에 먼저 쓴 뒤 os.replace로 교체한다.
 
@@ -309,18 +346,14 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        try:
-            # 임시 파일은 0600으로 만들어지므로, 기존 파일의 권한을 잇거나 기본 권한으로 되돌린다.
-            mode = (path.stat().st_mode & 0o777) if path.exists() else DEFAULT_FILE_MODE
+        # 임시 파일은 0600으로 만들어지므로, 기존 파일의 권한을 잇거나 기본 권한으로 되돌린다.
+        mode = (path.stat().st_mode & 0o777) if path.exists() else DEFAULT_FILE_MODE
+        with contextlib.suppress(OSError):
             os.chmod(tmp_name, mode)
-        except OSError:
-            pass
         os.replace(tmp_name, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp_name)
-        except OSError:
-            pass
         raise
 
 
@@ -456,7 +489,7 @@ def parse_hwp_auto_number(payload: bytes) -> str:
     return f"{decorate(prefix)}{format_auto_number(number, (prop >> 4) & 0xFF)}{decorate(suffix)}"
 
 
-def hwp_paragraph_controls(records: list[tuple[int, int, bytes]], text_idx: int) -> Optional[dict[bytes, list[str]]]:
+def hwp_paragraph_controls(records: list[tuple[int, int, bytes]], text_idx: int) -> dict[bytes, list[str]] | None:
     """PARA_TEXT 뒤에 나오는 같은 문단의 하이퍼링크 주소와 자동 번호를 순서대로 모은다."""
     payload = records[text_idx][2]
     if HWP_HYPERLINK_CTRL_ID not in payload and HWP_AUTO_NUMBER_CTRL_ID not in payload:
@@ -475,7 +508,7 @@ def hwp_paragraph_controls(records: list[tuple[int, int, bytes]], text_idx: int)
     return controls
 
 
-def clean_hwp_text_payload(payload: bytes, controls: Optional[dict[bytes, list[str]]] = None) -> str:
+def clean_hwp_text_payload(payload: bytes, controls: dict[bytes, list[str]] | None = None) -> str:
     """HWP PARA_TEXT 레코드에서 사람이 읽을 수 있는 문자열을 최대한 보수적으로 추출한다.
 
     HWP 바이너리 텍스트에는 문단/표/그림/필드 제어 문자가 UTF-16 코드 단위 사이에
@@ -495,13 +528,13 @@ def clean_hwp_text_payload(payload: bytes, controls: Optional[dict[bytes, list[s
     return structured
 
 
-def clean_hwp_decoded_text(s: str, skip_extended_controls: bool, controls: Optional[dict[bytes, list[str]]] = None) -> str:
+def clean_hwp_decoded_text(s: str, skip_extended_controls: bool, controls: dict[bytes, list[str]] | None = None) -> str:
     out: list[str] = []
     links = controls.get(HWP_HYPERLINK_CTRL_ID) if controls else None
     pending_links = iter(links or [])
     pending_numbers = iter(controls.get(HWP_AUTO_NUMBER_CTRL_ID) or []) if controls else iter(())
     # 필드 시작(3)과 끝(4)은 짝을 이루며 중첩될 수 있다. 하이퍼링크 필드만 링크 번호를 기억한다.
-    open_fields: list[Optional[str]] = []
+    open_fields: list[str | None] = []
     i = 0
     while i < len(s):
         ch = s[i]
@@ -578,7 +611,12 @@ def text_without_digits(text: str) -> str:
     return re.sub(r"\d|[.,+\-△%]", "", text)
 
 
-def parse_hwp_records(data: bytes) -> Iterable[tuple[int, int, bytes]]:
+def parse_hwp_records(data: bytes, problems: list[str] | None = None) -> Iterable[tuple[int, int, bytes]]:
+    """HWP 레코드 스트림을 (태그, 레벨, 페이로드)로 나눈다.
+
+    스트림이 중간에 잘려 있으면 읽을 수 있는 데까지 내고, problems가 주어지면
+    남은 바이트 수를 적는다(호출부가 SECTION_TRUNCATED 경고로 남긴다).
+    """
     pos = 0
     size_data = len(data)
     while pos + 4 <= size_data:
@@ -589,20 +627,28 @@ def parse_hwp_records(data: bytes) -> Iterable[tuple[int, int, bytes]]:
         rec_size = (header >> 20) & 0xFFF
         if rec_size == 0xFFF:
             if pos + 4 > size_data:
-                break
+                if problems is not None:
+                    problems.append(f"레코드 크기 필드가 {size_data - pos}바이트만 남은 지점에서 잘렸습니다")
+                return
             rec_size = struct.unpack_from("<I", data, pos)[0]
             pos += 4
-        if rec_size < 0 or pos + rec_size > size_data:
-            break
+        if pos + rec_size > size_data:
+            if problems is not None:
+                problems.append(
+                    f"레코드가 {size_data - pos}바이트만 남은 지점에서 잘렸습니다(선언된 크기 {rec_size}바이트)"
+                )
+            return
         yield tag_id, level, data[pos : pos + rec_size]
         pos += rec_size
+    if problems is not None and pos != size_data:
+        problems.append(f"스트림 끝에 해석되지 않은 {size_data - pos}바이트가 남아 있습니다")
 
 
 def is_hwp_table_control(payload: bytes) -> bool:
     return payload.startswith(HWP_TABLE_CTRL_ID)
 
 
-def parse_hwp_table_dimensions(payload: bytes) -> Optional[tuple[int, int]]:
+def parse_hwp_table_dimensions(payload: bytes) -> tuple[int, int] | None:
     if len(payload) < 8:
         return None
     rows = struct.unpack_from("<H", payload, 4)[0]
@@ -612,7 +658,7 @@ def parse_hwp_table_dimensions(payload: bytes) -> Optional[tuple[int, int]]:
     return rows, cols
 
 
-def parse_hwp_table_cell_header(payload: bytes, rows: int, cols: int) -> Optional[TableCell]:
+def parse_hwp_table_cell_header(payload: bytes, rows: int, cols: int) -> TableCell | None:
     if len(payload) < 16:
         return None
     col = struct.unpack_from("<H", payload, 8)[0]
@@ -630,7 +676,8 @@ def parse_hwp_table_records(
     heading_policy: str,
     document_has_blocks: bool,
     include_page_artifacts: bool,
-) -> Optional[tuple[list[Block], int]]:
+    flattened: list[str] | None = None,
+) -> tuple[list[Block], int] | None:
     """HWP table control 주변 레코드를 Markdown용 table/paragraph 블록으로 복원한다.
 
     HWP 5.x 본문 레코드는 표 셀의 실제 텍스트를 일반 문단 레코드로 저장하되,
@@ -641,10 +688,10 @@ def parse_hwp_table_records(
     if tag != HWP_CTRL_HEADER_TAG or not is_hwp_table_control(payload):
         return None
 
-    rows: Optional[int] = None
-    cols: Optional[int] = None
+    rows: int | None = None
+    cols: int | None = None
     cells: list[TableCell] = []
-    current_cell: Optional[TableCell] = None
+    current_cell: TableCell | None = None
     caption_lines: list[str] = []
     idx = start_idx + 1
     saw_table_record = False
@@ -669,7 +716,7 @@ def parse_hwp_table_records(
                 cells.append(current_cell)
         elif current_cell is not None and rec_tag == HWP_CTRL_HEADER_TAG and rec_level > table_level + 1:
             control_id = rec_payload[:4]
-            addition: Optional[str] = None
+            addition: str | None = None
             if control_id in HWP_FOOTNOTE_CTRL_IDS:
                 footnote_text, next_idx = extract_hwp_footnote(records, idx)
                 if footnote_text:
@@ -696,7 +743,16 @@ def parse_hwp_table_records(
     if not saw_table_record or rows is None or cols is None or not cells:
         return None
 
-    blocks = finalize_table_blocks(rows, cols, cells, caption_lines, heading_policy, document_has_blocks, include_page_artifacts)
+    blocks = finalize_table_blocks(
+        rows,
+        cols,
+        cells,
+        caption_lines,
+        heading_policy,
+        document_has_blocks,
+        include_page_artifacts,
+        flattened=flattened,
+    )
     return blocks, idx
 
 
@@ -708,8 +764,13 @@ def finalize_table_blocks(
     heading_policy: str,
     document_has_blocks: bool,
     include_page_artifacts: bool,
+    flattened: list[str] | None = None,
 ) -> list[Block]:
-    """복원한 표(HWP/HWPX 공용)를 보도자료 머리표/결재란/표/문단 중 알맞은 블록으로 바꾼다."""
+    """복원한 표(HWP/HWPX 공용)를 보도자료 머리표/결재란/표/문단 중 알맞은 블록으로 바꾼다.
+
+    표로 살리지 못해 문단으로 푼 경우 그 크기를 flattened에 모은다(1×1 서식 상자는
+    HWP에서 본문을 상자에 넣는 관행이라 손실로 세지 않는다).
+    """
     grid = build_hwp_table_grid(rows, cols, cells)
     table_text = " ".join(cell.text for cell in cells if cell.text).strip()
     caption_blocks: list[Block] = []
@@ -728,13 +789,15 @@ def finalize_table_blocks(
     if should_render_hwp_table(rows, cols, cells, grid):
         return caption_blocks + [Block(type="table", rows=grid, cells=cells)]
 
-    flattened: list[Block] = list(caption_blocks)
+    flattened_blocks: list[Block] = list(caption_blocks)
     for cell in sorted(cells, key=lambda item: (item.row, item.col)):
         for part in split_text_to_candidate_blocks(cell.text):
-            is_first = not document_has_blocks and not flattened
+            is_first = not document_has_blocks and not flattened_blocks
             # 표 칸의 숫자는 쪽 번호가 아니라 데이터이므로 쪽 번호 필터를 적용하지 않는다.
-            append_text_block(flattened, part, heading_policy, is_first=is_first, include_page_artifacts=True)
-    return flattened
+            append_text_block(flattened_blocks, part, heading_policy, is_first=is_first, include_page_artifacts=True)
+    if flattened is not None and not (rows == 1 and cols == 1):
+        flattened.append(f"{rows}×{cols}")
+    return flattened_blocks
 
 
 def build_hwp_table_grid(rows: int, cols: int, cells: list[TableCell]) -> list[list[str]]:
@@ -834,9 +897,7 @@ def parse_press_release_metadata(cells: list[TableCell]) -> dict[str, Any]:
                 metadata["distributed_at"] = value
             elif label == "보도일시" and value:
                 metadata["release_at"] = value
-            elif label in {"담당부서", "담당/부서"} and value:
-                metadata["department"] = value
-            elif label == "부서" and value and "department" not in metadata:
+            elif label in {"담당부서", "담당/부서"} and value or label == "부서" and value and "department" not in metadata:
                 metadata["department"] = value
             elif label == "담당자" and value:
                 metadata["contact"] = value
@@ -866,7 +927,7 @@ PRESS_INLINE_LABEL_RE = re.compile(
 )
 
 
-def next_metadata_value_index(texts: list[str], label_index: int) -> Optional[int]:
+def next_metadata_value_index(texts: list[str], label_index: int) -> int | None:
     for index in range(label_index + 1, len(texts)):
         if re.sub(r"\s+", "", texts[index]) in PRESS_LABEL_WORDS:
             continue
@@ -874,7 +935,7 @@ def next_metadata_value_index(texts: list[str], label_index: int) -> Optional[in
     return None
 
 
-def next_metadata_value(texts: list[str], label_index: int) -> Optional[str]:
+def next_metadata_value(texts: list[str], label_index: int) -> str | None:
     index = next_metadata_value_index(texts, label_index)
     return texts[index] if index is not None else None
 
@@ -887,7 +948,7 @@ PRESS_ROLE_WORDS = frozenset({
 })
 
 
-def parse_press_contacts(text: str, department: Optional[str] = None) -> list[dict[str, str]]:
+def parse_press_contacts(text: str, department: str | None = None) -> list[dict[str, str]]:
     cleaned = re.sub(r"[∙•]", " ", text)
     parts = re.split(r"☎|전화|Tel\.?", cleaned, maxsplit=1, flags=re.I)
     people_text = parts[0]
@@ -903,7 +964,10 @@ def parse_press_contacts(text: str, department: Optional[str] = None) -> list[di
         tokens = item.split()
         if not tokens:
             continue
-        is_name = lambda token: token not in PRESS_ROLE_WORDS and re.fullmatch(r"[가-힣]{2,4}", token)
+
+        def is_name(token: str) -> bool:
+            return token not in PRESS_ROLE_WORDS and bool(re.fullmatch(r"[가-힣]{2,4}", token))
+
         pairs: list[tuple[str, str]] = []
         if any(token in PRESS_ROLE_WORDS for token in tokens):
             # 직급 목록으로 직급과 이름을 가리므로 "직급 이름"과 "이름 직급" 순서를 모두 읽는다.
@@ -1008,7 +1072,22 @@ def read_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> b
     return data
 
 
+def hwp_stream_size(ole: Any, stream: list[str] | str) -> int | None:
+    """스트림 크기를 읽기 전에 묻는다. 알 수 없으면 None(이때는 읽으면서 한도로 자른다)."""
+    try:
+        size = ole.get_size(stream)
+    except (OSError, TypeError, ValueError):
+        return None
+    return size if isinstance(size, int) and size >= 0 else None
+
+
 def read_hwp_stream(ole: Any, stream: list[str] | str, compressed: bool, distributed: bool = False) -> bytes:
+    # 압축하지 않은 스트림은 한도 검사 없이 통째로 메모리에 올라간다. 크기를 먼저 확인해 막는다.
+    size = hwp_stream_size(ole, stream)
+    if size is not None and size > MAX_SECTION_BYTES:
+        raise DecompressLimitError(
+            f"스트림 크기가 {format_megabytes(size)}로 한도({format_megabytes(MAX_SECTION_BYTES)})를 넘어 읽지 않았습니다"
+        )
     data = ole.openstream(stream).read()
     if distributed:
         data = decrypt_hwp_view_text(data)
@@ -1059,7 +1138,7 @@ def hwp_distribution_key(payload: bytes) -> bytes:
     return bytes(data[offset : offset + 16])
 
 
-_AES_TABLES: Optional[tuple[list[int], list[int], list[list[int]]]] = None
+_AES_TABLES: tuple[list[int], list[int], list[list[int]]] | None = None
 
 
 def aes_tables() -> tuple[list[int], list[int], list[list[int]]]:
@@ -1311,6 +1390,14 @@ def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode:
     total_bytes = 0
     for idx, stream in enumerate(bin_streams, start=1):
         source_name = stream[-1]
+        stream_size = hwp_stream_size(ole, stream)
+        if stream_size is not None and stream_size > MAX_ASSET_BYTES:
+            warnings.append(WarningItem(
+                "ASSET_SKIPPED",
+                f"{ole_stream_name(stream)}: 스트림 크기가 {format_megabytes(stream_size)}로 한도({format_megabytes(MAX_ASSET_BYTES)})를 넘어 읽지 않았습니다.",
+                ole_stream_name(stream),
+            ))
+            continue
         raw_data = ole.openstream(stream).read()
         try:
             data = decode_hwp_bindata(raw_data)
@@ -1340,7 +1427,7 @@ def extract_hwp_assets(ole: Any, input_path: Path, assets_dir: Path, image_mode:
     return assets
 
 
-def parse_bindata_index(name: str) -> Optional[int]:
+def parse_bindata_index(name: str) -> int | None:
     match = re.search(r"BIN([0-9A-Fa-f]+)", name)
     if not match:
         return None
@@ -1379,7 +1466,7 @@ def guess_extension(data: bytes) -> str:
     return ".bin"
 
 
-def bmp_to_png(data: bytes) -> Optional[bytes]:
+def bmp_to_png(data: bytes) -> bytes | None:
     """Convert simple uncompressed BMP data to PNG without external dependencies."""
     if not data.startswith(b"BM") or len(data) < 54:
         return None
@@ -1437,12 +1524,12 @@ def append_image_anchor_if_caption(blocks: list[Block]) -> bool:
     return False
 
 
-def last_content_block(blocks: list[Block]) -> Optional[Block]:
+def last_content_block(blocks: list[Block]) -> Block | None:
     # 마지막 본문 블록만 필요하므로 뒤에서부터 찾는다(전체 목록을 복사하면 도형이 많은 문서에서 제곱 시간이 걸린다).
     return next((block for block in reversed(blocks) if block.type not in NON_CONTENT_BLOCK_TYPES), None)
 
 
-def parse_hwp_picture_bin_id(payload: bytes) -> Optional[int]:
+def parse_hwp_picture_bin_id(payload: bytes) -> int | None:
     """그림 개체 레코드(0x55)에서 BinData 아이템 ID를 읽는다.
 
     레이아웃은 테두리 선·꼭짓점·자르기·안쪽 여백 뒤 offset 71의 UINT16이다.
@@ -1470,7 +1557,7 @@ def hwp_shape_picture_bin_ids(records: list[tuple[int, int, bytes]], start_idx: 
     return found
 
 
-def extract_hwp_equation(records: list[tuple[int, int, bytes]], start_idx: int) -> Optional[str]:
+def extract_hwp_equation(records: list[tuple[int, int, bytes]], start_idx: int) -> str | None:
     _tag, control_level, _payload = records[start_idx]
     for idx in range(start_idx + 1, len(records)):
         tag, level, payload = records[idx]
@@ -1481,7 +1568,7 @@ def extract_hwp_equation(records: list[tuple[int, int, bytes]], start_idx: int) 
     return None
 
 
-def normalize_hwp_equation(payload: bytes) -> Optional[str]:
+def normalize_hwp_equation(payload: bytes) -> str | None:
     script = hwp_equation_script(payload)
     if script is None:
         # 글자 수가 깨졌으면 머리(6바이트) 뒤부터 첫 NUL(글자 크기 필드) 앞까지를 스크립트로 보고 끝의 잡문자를 걷어낸다.
@@ -1494,7 +1581,7 @@ def normalize_hwp_equation(payload: bytes) -> Optional[str]:
     return hwp_equation_to_latex(script)
 
 
-def hwp_equation_script(payload: bytes) -> Optional[str]:
+def hwp_equation_script(payload: bytes) -> str | None:
     # EQEDIT 레코드: 속성(UINT32), 스크립트 글자 수(WORD), 스크립트(WCHAR), 이어서 글자 크기·색·버전·글꼴 이름.
     if len(payload) < 6:
         return None
@@ -1805,7 +1892,7 @@ class AssetPlacementSummary:
     excluded: int = 0
 
 
-def next_unplaced_inline_asset(inline_assets: list[Asset], placed_assets: set[str], start_index: int) -> tuple[Optional[Asset], int]:
+def next_unplaced_inline_asset(inline_assets: list[Asset], placed_assets: set[str], start_index: int) -> tuple[Asset | None, int]:
     index = start_index
     while index < len(inline_assets) and inline_assets[index].output in placed_assets:
         index += 1
@@ -1844,7 +1931,7 @@ class AssetPlacementPlan:
     approximated: int = 0
 
 
-def plan_asset_placements(visible_blocks: list[Block], inline_assets: list[Asset], all_assets: Optional[list[Asset]] = None) -> AssetPlacementPlan:
+def plan_asset_placements(visible_blocks: list[Block], inline_assets: list[Asset], all_assets: list[Asset] | None = None) -> AssetPlacementPlan:
     """그림 control 위치를 우선 쓰고, 위치를 모르는 그림만 캡션 순서로 채운다.
 
     target이 있는 앵커는 그 자산을 그 자리에서 쓴다(같은 그림이 여러 번 나오면 모두 그린다).
@@ -1865,7 +1952,7 @@ def plan_asset_placements(visible_blocks: list[Block], inline_assets: list[Asset
     index = 0
     placed = plan.placed
 
-    def take_next() -> Optional[Asset]:
+    def take_next() -> Asset | None:
         nonlocal index
         while index < len(inline_assets) and (inline_assets[index].output in placed or inline_assets[index].output in reserved):
             index += 1
@@ -1948,6 +2035,18 @@ def add_page_artifact_warnings(blocks: list[Block], warnings: list[WarningItem],
     losses.append(LossItem("PAGE_ARTIFACT_TABLE_DROPPED", len(dropped)))
 
 
+def add_table_flatten_warnings(flattened: list[str], warnings: list[WarningItem], losses: list[LossItem]) -> None:
+    """표를 문단으로 풀었을 때 한 번만 집계해 알린다(1×1 서식 상자는 수집 단계에서 제외)."""
+    if not flattened:
+        return
+    shapes = ", ".join(sorted(set(flattened)))
+    warnings.append(WarningItem(
+        "TABLE_FLATTENED",
+        f"2차원 구조를 유지하기 어려운 표 {len(flattened)}개를 문단으로 풀었습니다(크기: {shapes}). 셀 경계는 사라지고 글자만 남습니다.",
+    ))
+    losses.append(LossItem("TABLE_STRUCTURE_FLATTENED", len(flattened)))
+
+
 def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: ConvertOptions) -> ConvertResult:
     olefile = import_olefile()
     if not olefile.isOleFile(str(input_path)):
@@ -1996,13 +2095,22 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
         seen_header_footer: set[str] = set()
         empty_footnotes = 0
         repeated_header_footer = 0
+        flattened_tables: list[str] = []
         for section in sections:
+            stream_label = ole_stream_name(section)
             try:
                 data = read_hwp_stream(ole, section, compressed, distributed)
-            except Exception as exc:
-                warnings.append(WarningItem("SECTION_DECOMPRESS_FAILED", f"{ole_stream_name(section)} {'복호화/' if distributed else ''}압축 해제 실패: {exc}", ole_stream_name(section)))
+            except DecompressLimitError as exc:
+                # 크기 한도를 넘는 스트림은 메모리에 올리지 않고 건너뛰다.
+                warnings.append(WarningItem("SECTION_SKIPPED", f"{stream_label}: {exc}", stream_label))
                 continue
-            records = list(parse_hwp_records(data))
+            except (OSError, zlib.error, struct.error, ValueError) as exc:
+                warnings.append(WarningItem("SECTION_DECOMPRESS_FAILED", f"{stream_label} {'복호화/' if distributed else ''}압축 해제 실패: {exc}", stream_label))
+                continue
+            truncation: list[str] = []
+            records = list(parse_hwp_records(data, truncation))
+            if truncation:
+                warnings.append(WarningItem("SECTION_TRUNCATED", f"{stream_label}: {truncation[0]}", stream_label))
             for rec_tag, _rec_level, rec_payload in records:
                 if rec_tag == HWP_CTRL_HEADER_TAG:
                     control_id = rec_payload[:4]
@@ -2015,12 +2123,13 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                     control_id = payload[:4]
                     if is_hwp_table_control(payload):
                         parsed_table = parse_hwp_table_records(
-                        records,
-                        idx,
-                        options.heading_policy,
-                        document_has_blocks=has_content_blocks(blocks),
-                        include_page_artifacts=options.include_page_artifacts,
-                    )
+                            records,
+                            idx,
+                            options.heading_policy,
+                            document_has_blocks=has_content_blocks(blocks),
+                            include_page_artifacts=options.include_page_artifacts,
+                            flattened=flattened_tables,
+                        )
                         if parsed_table:
                             table_blocks, next_idx = parsed_table
                             blocks.extend(table_blocks)
@@ -2094,13 +2203,15 @@ def convert_hwp(input_path: Path, output_path: Path, assets_dir: Path, options: 
                     for part in split_text_to_candidate_blocks(clean_plain_text(preview)):
                         append_text_block(blocks, part, options.heading_policy, include_page_artifacts=options.include_page_artifacts)
                     warnings.append(WarningItem("PREVIEW_TEXT_USED", "BodyText 추출 결과가 비어 있어 PrvText를 fallback으로 사용했습니다."))
-                except Exception:
-                    pass
+                except (OSError, UnicodeDecodeError, ValueError) as exc:
+                    # 미리보기 글자가 깨져도 본문 변환은 계속하되, 폴백이 실패했음을 리포트에 남긴다.
+                    warnings.append(WarningItem("PREVIEW_TEXT_FAILED", f"PrvText fallback을 읽지 못했습니다: {exc}"))
 
         losses.append(LossItem("LAYOUT_DROPPED", 1))
         losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
         normalize_heading_structure(blocks)
         add_page_artifact_warnings(blocks, warnings, losses)
+        add_table_flatten_warnings(flattened_tables, warnings, losses)
         if repeated_header_footer:
             warnings.append(WarningItem(
                 "HEADER_FOOTER_REPEATS_COLLAPSED",
@@ -2144,7 +2255,7 @@ def normalize_hwp_leading_marker(text: str) -> str:
     return text.strip()
 
 
-def parse_private_number_heading(text: str) -> Optional[tuple[int, str]]:
+def parse_private_number_heading(text: str) -> tuple[int, str] | None:
     stripped = text.strip()
     if not stripped:
         return None
@@ -2157,7 +2268,7 @@ def parse_private_number_heading(text: str) -> Optional[tuple[int, str]]:
     return None
 
 
-def strip_private_bullet(text: str) -> Optional[str]:
+def strip_private_bullet(text: str) -> str | None:
     stripped = text.strip()
     if stripped.startswith(HWP_PRIVATE_SQUARE_BULLET):
         body = stripped[1:].strip()
@@ -2169,16 +2280,14 @@ def is_page_artifact_text(text: str) -> bool:
     stripped = text.strip()
     # 숫자만 있는 문단은 목차 번호·제목 번호·단 번호 같은 본문일 수 있어 지우지 않는다.
     # 쪽 번호는 꼬리말 컨트롤로 따로 처리된다.
-    if stripped in {"╣", "║", "│", "┃"}:
-        return True
-    return False
+    return stripped in {"╣", "║", "│", "┃"}
 
 
 def append_text_block(
     blocks: list[Block],
     text: str,
     heading_policy: str,
-    is_first: Optional[bool] = None,
+    is_first: bool | None = None,
     include_page_artifacts: bool = False,
 ) -> None:
     if not text:
@@ -2223,7 +2332,7 @@ def append_text_block(
         blocks.append(Block(type="paragraph", text=text))
 
 
-def parse_explicit_heading(text: str) -> Optional[tuple[int, str]]:
+def parse_explicit_heading(text: str) -> tuple[int, str] | None:
     stripped = text.strip()
     if not stripped:
         return None
@@ -2298,12 +2407,10 @@ def is_letterhead_or_metadata_line(text: str) -> bool:
         return True
     if ADDRESS_LINE_RE.search(stripped):
         return True
-    if re.fullmatch(r"[\d\s()+.-]{7,}", stripped):
-        return True
-    return False
+    return bool(re.fullmatch(r"[\d\s()+.-]{7,}", stripped))
 
 
-def infer_heading_level(text: str, policy: str, is_first: bool = False) -> Optional[int]:
+def infer_heading_level(text: str, policy: str, is_first: bool = False) -> int | None:
     if policy == "none":
         return None
     stripped = text.strip()
@@ -2325,13 +2432,14 @@ def infer_heading_level(text: str, policy: str, is_first: bool = False) -> Optio
         return min(6, max(3, depth + 1))
     if policy == "font" and len(stripped) <= 40:
         # 문서 제목 후보: 종결 어미 문장이나 긴 설명문은 제목으로 승격하지 않는다.
-        if not re.search(r"[다요음임함됨됨]\.?$", stripped) and not stripped.endswith((".", ",", ";", ":")):
-            if re.search(r"(보고|계획|검토|회의|현황|경위|근거|의견|총괄|요구사항|질의|회신|안내|지침|공문|제목)$", stripped):
-                return 2
+        ends_like_sentence = re.search(r"[다요음임함됨됨]\.?$", stripped) or stripped.endswith((".", ",", ";", ":"))
+        looks_like_title = re.search(r"(보고|계획|검토|회의|현황|경위|근거|의견|총괄|요구사항|질의|회신|안내|지침|공문|제목)$", stripped)
+        if looks_like_title and not ends_like_sentence:
+            return 2
     return None
 
 
-def numbered_entry_number(block: Block) -> Optional[int]:
+def numbered_entry_number(block: Block) -> int | None:
     if block.type == "ordered_list" and block.number is not None:
         # list_match로 이미 목록이 된 항목은 글자에서 번호를 뗐으므로 number를 쓴다.
         return block.number
@@ -2397,7 +2505,7 @@ def normalize_heading_structure(blocks: list[Block]) -> None:
     normalize_legal_numbered_headings(blocks)
 
 
-def parse_table_like_text(text: str) -> Optional[list[list[str]]]:
+def parse_table_like_text(text: str) -> list[list[str]] | None:
     if "\t" not in text:
         return None
     rows = []
@@ -2417,7 +2525,7 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
     with zipfile.ZipFile(input_path) as zf:
         names = zf.namelist()
         if is_encrypted_hwpx(zf, names):
-            raise ConversionError("암호화된 HWPX 문서는 지원하지 않습니다. 한글에서 암호를 해제한 뒤 다시 변환하세요.")
+            raise ConversionError(encrypted_hwpx_message(input_path))
         section_names = sorted([n for n in names if re.search(r"(?:^|/)section\d+\.xml$", n, re.I)])
         if not section_names:
             # 일부 HWPX는 Contents/content.hpf에서 section 목록을 간접 참조한다.
@@ -2425,6 +2533,7 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
         if not section_names:
             raise ConversionError("HWPX section XML을 찾을 수 없습니다.")
 
+        flattened_tables: list[str] = []
         for section_name in section_names:
             try:
                 section_data = read_zip_member(zf, zf.getinfo(section_name), MAX_SECTION_BYTES)
@@ -2433,10 +2542,10 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
                 continue
             try:
                 root = ET.fromstring(section_data)
-            except Exception as exc:
+            except ET.ParseError as exc:
                 warnings.append(WarningItem("HWPX_XML_PARSE_FAILED", f"{section_name} 파싱 실패: {exc}", section_name))
                 continue
-            walk_hwpx_blocks(root, blocks, options.heading_policy, options.include_page_artifacts)
+            walk_hwpx_blocks(root, blocks, options.heading_policy, options.include_page_artifacts, flattened=flattened_tables)
 
         if options.image_mode != "skip":
             bin_names = [n for n in names if n.lower().startswith("bindata/") and not n.endswith("/")]
@@ -2478,6 +2587,7 @@ def convert_hwpx(input_path: Path, output_path: Path, assets_dir: Path, options:
     losses.append(LossItem("LAYOUT_DROPPED", 1))
     losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
     normalize_heading_structure(blocks)
+    add_table_flatten_warnings(flattened_tables, warnings, losses)
     report = build_report(input_path, "hwpx", blocks, assets, warnings, losses)
     markdown = render_markdown(input_path, blocks, assets, report, options, output_path, assets_dir)
     return ConvertResult(markdown=markdown, report=report, blocks=blocks, assets=assets)
@@ -2489,7 +2599,7 @@ HWPML_TAG_MAP = {
 }
 
 
-def hwpml_to_hwpx_tree(elem: ET.Element, open_fields: Optional[list[str]] = None) -> ET.Element:
+def hwpml_to_hwpx_tree(elem: ET.Element, open_fields: list[str] | None = None) -> ET.Element:
     """HWPML(한글 XML) 본문을 HWPX와 같은 이름의 트리로 옮겨 HWPX 변환 경로를 그대로 쓰게 한다."""
     if open_fields is None:
         open_fields = []
@@ -2530,6 +2640,7 @@ def convert_hwpml(input_path: Path, output_path: Path, assets_dir: Path, options
     losses: list[LossItem] = []
     blocks: list[Block] = []
     assets: list[Asset] = []
+    flattened_tables: list[str] = []
 
     if input_path.stat().st_size > MAX_SECTION_BYTES + MAX_TOTAL_ASSET_BYTES:
         raise ConversionError(f"HWPML 파일이 너무 큽니다 (한도 {format_megabytes(MAX_SECTION_BYTES + MAX_TOTAL_ASSET_BYTES)}).")
@@ -2540,7 +2651,7 @@ def convert_hwpml(input_path: Path, output_path: Path, assets_dir: Path, options
     body = root.find("BODY")
     if body is None:
         raise ConversionError("HWPML BODY 요소를 찾을 수 없습니다.")
-    walk_hwpx_blocks(hwpml_to_hwpx_tree(body), blocks, options.heading_policy, options.include_page_artifacts)
+    walk_hwpx_blocks(hwpml_to_hwpx_tree(body), blocks, options.heading_policy, options.include_page_artifacts, flattened=flattened_tables)
 
     if options.image_mode != "skip":
         # 그림은 TAIL/BINDATASTORAGE에 base64로 들어 있다. 적힌 Format이 실제와 다를 수 있어 내용으로 판별한다.
@@ -2561,10 +2672,9 @@ def convert_hwpml(input_path: Path, output_path: Path, assets_dir: Path, options
                 warnings.append(WarningItem("ASSET_SKIPPED", f"{source}: base64 해석 실패 ({exc})", source))
                 continue
             if guess_extension(data) == ".bin":
-                try:
+                # 압축된 BinData는 풀어 보고, 풀리지 않으면 원본 그대로 둘다.
+                with contextlib.suppress(zlib.error, DecompressLimitError):
                     data = bounded_zlib_decompress(data, -15, MAX_ASSET_BYTES)
-                except (zlib.error, DecompressLimitError):
-                    pass
             if len(data) > MAX_ASSET_BYTES or total_bytes + len(data) > MAX_TOTAL_ASSET_BYTES:
                 warnings.append(WarningItem("ASSET_SKIPPED", f"{source}: 그림 크기가 한도를 넘습니다", source))
                 continue
@@ -2592,9 +2702,20 @@ def convert_hwpml(input_path: Path, output_path: Path, assets_dir: Path, options
     losses.append(LossItem("LAYOUT_DROPPED", 1))
     losses.append(LossItem("CHARACTER_STYLE_PARTIALLY_DROPPED", 1))
     normalize_heading_structure(blocks)
+    add_table_flatten_warnings(flattened_tables, warnings, losses)
     report = build_report(input_path, "hwpml", blocks, assets, warnings, losses)
     markdown = render_markdown(input_path, blocks, assets, report, options, output_path, assets_dir)
     return ConvertResult(markdown=markdown, report=report, blocks=blocks, assets=assets)
+
+
+def encrypted_hwpx_message(input_path: Path) -> str:
+    """확장자와 실제 형식이 다른 경우까지 구분해 안내한다(P2-10)."""
+    if input_path.suffix.lower() == ".hwp":
+        return (
+            "이 파일은 확장자가 .hwp지만 내용은 암호가 걸린 HWPX(ZIP) 문서입니다. "
+            "한글에서 암호를 풀어 저장하거나 .hwpx로 다시 저장한 뒤 변환하세요."
+        )
+    return "암호화된 HWPX 문서는 지원하지 않습니다. 한글에서 암호를 해제한 뒤 다시 변환하세요."
 
 
 def is_encrypted_hwpx(zf: zipfile.ZipFile, names: list[str]) -> bool:
@@ -2613,12 +2734,12 @@ def local_name(elem: ET.Element) -> str:
     return elem.tag.rsplit("}", 1)[-1] if "}" in elem.tag else elem.tag
 
 
-def collect_text(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
+def collect_text(elem: ET.Element, skip: set[int] | None = None) -> str:
     # HWPX도 HWP와 같이 Wingdings/Symbol 글꼴 기호를 사용자 정의 영역 글자로 저장한다.
     return finalize_link_marks(clean_plain_text(collect_text_with_inline_styles(elem, skip).translate(HWP_SYMBOL_FONT_MAP)))
 
 
-def collect_text_with_inline_styles(elem: ET.Element, skip: Optional[set[int]] = None) -> str:
+def collect_text_with_inline_styles(elem: ET.Element, skip: set[int] | None = None) -> str:
     name = local_name(elem)
     if name == "shapeComment":
         # 그림 설명(원본 파일명·크기·촬영일 등)은 본문 글자가 아니다.
@@ -2710,7 +2831,7 @@ def hwpx_paragraph_lines(container: ET.Element) -> list[str]:
     return lines
 
 
-def parse_hwpx_table(table: ET.Element) -> Optional[tuple[int, int, list[TableCell], list[str]]]:
+def parse_hwpx_table(table: ET.Element) -> tuple[int, int, list[TableCell], list[str]] | None:
     cells: list[TableCell] = []
     caption_lines: list[str] = []
     for child in list(table):
@@ -2722,7 +2843,7 @@ def parse_hwpx_table(table: ET.Element) -> Optional[tuple[int, int, list[TableCe
             addr = next((x for x in list(tc) if local_name(x) == "cellAddr"), None)
             span = next((x for x in list(tc) if local_name(x) == "cellSpan"), None)
 
-            def number(node: Optional[ET.Element], key: str, default: int) -> int:
+            def number(node: ET.Element | None, key: str, default: int) -> int:
                 try:
                     return max(0, int(node.get(key))) if node is not None and node.get(key) is not None else default
                 except ValueError:
@@ -2742,15 +2863,30 @@ def parse_hwpx_table(table: ET.Element) -> Optional[tuple[int, int, list[TableCe
     return rows, cols, cells, caption_lines
 
 
-def hwpx_table_blocks(table: ET.Element, blocks: list[Block], heading_policy: str, include_page_artifacts: bool) -> list[Block]:
+def hwpx_table_blocks(
+    table: ET.Element,
+    blocks: list[Block],
+    heading_policy: str,
+    include_page_artifacts: bool,
+    flattened: list[str] | None = None,
+) -> list[Block]:
     parsed = parse_hwpx_table(table)
     if not parsed:
         return []
     rows, cols, cells, caption_lines = parsed
-    return finalize_table_blocks(rows, cols, cells, caption_lines, heading_policy, has_content_blocks(blocks), include_page_artifacts)
+    return finalize_table_blocks(
+        rows,
+        cols,
+        cells,
+        caption_lines,
+        heading_policy,
+        has_content_blocks(blocks),
+        include_page_artifacts,
+        flattened=flattened,
+    )
 
 
-def hwpx_picture_refs(elem: ET.Element, skip: Optional[set[int]] = None) -> list[str]:
+def hwpx_picture_refs(elem: ET.Element, skip: set[int] | None = None) -> list[str]:
     """elem 아래에서 표 밖에 있는 그림의 binaryItemIDRef를 문서 순서대로 모은다."""
     refs: list[str] = []
     for child in list(elem):
@@ -2768,10 +2904,16 @@ def hwpx_picture_refs(elem: ET.Element, skip: Optional[set[int]] = None) -> list
     return refs
 
 
-def walk_hwpx_blocks(elem: ET.Element, blocks: list[Block], heading_policy: str, include_page_artifacts: bool = False) -> None:
+def walk_hwpx_blocks(
+    elem: ET.Element,
+    blocks: list[Block],
+    heading_policy: str,
+    include_page_artifacts: bool = False,
+    flattened: list[str] | None = None,
+) -> None:
     name = local_name(elem)
     if name in HWPX_TABLE_NAMES:
-        blocks.extend(hwpx_table_blocks(elem, blocks, heading_policy, include_page_artifacts))
+        blocks.extend(hwpx_table_blocks(elem, blocks, heading_policy, include_page_artifacts, flattened=flattened))
         return
     if name == "pic":
         ref = next((node.get("binaryItemIDRef") for node in elem.iter() if local_name(node) == "img"), None)
@@ -2790,10 +2932,10 @@ def walk_hwpx_blocks(elem: ET.Element, blocks: list[Block], heading_policy: str,
         for ref in hwpx_picture_refs(elem, skip):
             blocks.append(Block(type="image_anchor", target=ref))
         for table in nested_tables:
-            blocks.extend(hwpx_table_blocks(table, blocks, heading_policy, include_page_artifacts))
+            blocks.extend(hwpx_table_blocks(table, blocks, heading_policy, include_page_artifacts, flattened=flattened))
         return
     for child in list(elem):
-        walk_hwpx_blocks(child, blocks, heading_policy, include_page_artifacts)
+        walk_hwpx_blocks(child, blocks, heading_policy, include_page_artifacts, flattened=flattened)
 
 
 def collect_metadata(blocks: list[Block]) -> dict[str, Any]:
@@ -2844,12 +2986,12 @@ def render_markdown(input_path: Path, blocks: list[Block], assets: list[Asset], 
     visible_blocks = content_blocks(blocks)
     profile = markdown_profile(options.markdown_format)
     if options.frontmatter == "yaml":
-        lines.extend(render_frontmatter(input_path, report, len(visible_blocks), len(assets), profile, visible_blocks))
+        lines.extend(render_frontmatter(input_path, report, len(visible_blocks), len(assets), profile, visible_blocks, source_path=options.source_path, output_path=output_path))
 
-    rel_assets_dir = os.path.relpath(assets_dir, output_path.parent).replace(os.sep, "/") if assets else ""
+    rel_assets_dir = relative_or_absolute(assets_dir, output_path.parent) if assets else ""
     inline_assets = select_inline_assets(assets, assets_dir)
     placement = plan_asset_placements(visible_blocks, inline_assets, assets)
-    last_list_type: Optional[str] = None
+    last_list_type: str | None = None
     ordered_index = 1
     footnotes: list[str] = []
     for idx, block in enumerate(visible_blocks):
@@ -2929,15 +3071,26 @@ def render_markdown(input_path: Path, blocks: list[Block], assets: list[Asset], 
     return md
 
 
-def render_frontmatter(input_path: Path, report: dict[str, Any], block_count: int, asset_count: int, profile: Optional[MarkdownProfile] = None, blocks: Optional[list[Block]] = None) -> list[str]:
-    lines = [
-        "---",
-        f"source: {json.dumps(str(input_path), ensure_ascii=False)}",
+def render_frontmatter(
+    input_path: Path,
+    report: dict[str, Any],
+    block_count: int,
+    asset_count: int,
+    profile: MarkdownProfile | None = None,
+    blocks: list[Block] | None = None,
+    source_path: str = "rel",
+    output_path: Path | None = None,
+) -> list[str]:
+    lines = ["---"]
+    source = source_display_path(input_path, output_path, source_path)
+    if source:
+        lines.append(f"source: {json.dumps(source, ensure_ascii=False)}")
+    lines.extend([
         f"format: {report['format']}",
         f"converted_by: hwp2md {VERSION}",
         f"blocks: {block_count}",
         f"assets: {asset_count}",
-    ]
+    ])
     if profile is not None and profile.extra_frontmatter:
         # Obsidian은 tags로 문서를 묶고 aliases로 문서를 다른 이름으로도 찾는다.
         lines.append(f"markdown_format: {profile.name}")
@@ -2957,7 +3110,7 @@ def render_frontmatter(input_path: Path, report: dict[str, Any], block_count: in
     return lines
 
 
-def render_asset_markdown(asset: Asset, rel_assets_dir: str, alt: Optional[str] = None, profile: Optional[MarkdownProfile] = None) -> str:
+def render_asset_markdown(asset: Asset, rel_assets_dir: str, alt: str | None = None, profile: MarkdownProfile | None = None) -> str:
     rel = f"{rel_assets_dir}/{asset.output}" if rel_assets_dir and rel_assets_dir != "." else asset.output
     suffix = Path(asset.output).suffix.lower()
     label = escape_md_text(alt or Path(asset.output).stem)
@@ -2999,7 +3152,7 @@ def select_inline_assets(assets: list[Asset], assets_dir: Path) -> list[Asset]:
     return selected
 
 
-def image_dimensions(path: Path) -> tuple[Optional[int], Optional[int]]:
+def image_dimensions(path: Path) -> tuple[int | None, int | None]:
     try:
         data = path.read_bytes()
     except OSError:
@@ -3007,7 +3160,7 @@ def image_dimensions(path: Path) -> tuple[Optional[int], Optional[int]]:
     return image_dimensions_from_bytes(data)
 
 
-def image_dimensions_from_bytes(data: bytes) -> tuple[Optional[int], Optional[int]]:
+def image_dimensions_from_bytes(data: bytes) -> tuple[int | None, int | None]:
     if data.startswith(b"BM") and len(data) >= 26:
         return struct.unpack_from("<I", data, 18)[0], abs(struct.unpack_from("<i", data, 22)[0])
     if data.startswith(b"\x89PNG") and len(data) >= 24:
@@ -3026,11 +3179,10 @@ def image_dimensions_from_bytes(data: bytes) -> tuple[Optional[int], Optional[in
             if pos + 2 > len(data):
                 break
             segment_size = int.from_bytes(data[pos : pos + 2], "big")
-            if 0xC0 <= marker <= 0xC3 or 0xC5 <= marker <= 0xC7 or 0xC9 <= marker <= 0xCB or 0xCD <= marker <= 0xCF:
-                if pos + 7 <= len(data):
-                    height = int.from_bytes(data[pos + 3 : pos + 5], "big")
-                    width = int.from_bytes(data[pos + 5 : pos + 7], "big")
-                    return width, height
+            if (0xC0 <= marker <= 0xC3 or 0xC5 <= marker <= 0xC7 or 0xC9 <= marker <= 0xCB or 0xCD <= marker <= 0xCF) and pos + 7 <= len(data):
+                height = int.from_bytes(data[pos + 3 : pos + 5], "big")
+                width = int.from_bytes(data[pos + 5 : pos + 7], "big")
+                return width, height
             pos += max(segment_size, 2)
     return None, None
 
@@ -3074,7 +3226,7 @@ def caption_is_for_following_image_anchor(blocks: list[Block], idx: int) -> bool
     return False
 
 
-def render_table(rows: list[list[str]], table_mode: str, cells: Optional[list[TableCell]] = None, table_style: str = "pipe") -> list[str]:
+def render_table(rows: list[list[str]], table_mode: str, cells: list[TableCell] | None = None, table_style: str = "pipe") -> list[str]:
     max_cols = max((len(r) for r in rows), default=0)
     if max_cols == 0:
         return []
@@ -3122,7 +3274,7 @@ def looks_like_header_row(row: list[str]) -> bool:
     return avg_len <= 30
 
 
-def render_html_table(rows: list[list[str]], cells: Optional[list[TableCell]] = None) -> list[str]:
+def render_html_table(rows: list[list[str]], cells: list[TableCell] | None = None) -> list[str]:
     out = ["<table>"]
     if cells:
         max_row = max((cell.row + cell.rowspan for cell in cells), default=len(rows))
@@ -3130,9 +3282,9 @@ def render_html_table(rows: list[list[str]], cells: Optional[list[TableCell]] = 
             row_cells = sorted([cell for cell in cells if cell.row == ridx], key=lambda item: item.col)
             if not row_cells:
                 continue
-            # 내용이 전혀 없고 다른 셀의 rowspan이 걸치지도 않은 빈 행은 출력하지 않는다.
-            covered_by_span = any(cell.row < ridx < cell.row + cell.rowspan for cell in cells)
-            if ridx > 0 and not covered_by_span and all(not cell.text.strip() and cell.rowspan == 1 for cell in row_cells):
+            # 글자가 하나도 없는 행은 출력하지 않는다. rowspan/colspan만 남은 rowspan>1 셀로 만든
+            # 빈 행(<tr><td rowspan="2"></td></tr>)도 같은 규칙으로 걸러진다.
+            if ridx > 0 and all(not cell.text.strip() for cell in row_cells):
                 continue
             parts = []
             for cell in row_cells:
@@ -3163,7 +3315,7 @@ def escape_table_cell(text: str) -> str:
     return "<br>".join(escaped)
 
 
-def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path], report_path: Optional[Path], options: ConvertOptions) -> ConvertResult:
+def convert_file(input_path: Path, output_path: Path, assets_dir: Path | None, report_path: Path | None, options: ConvertOptions) -> ConvertResult:
     """한 문서를 변환해 output_path/report_path에 원자적으로 씀다.
 
     넘겨받은 경로에 그대로 쓴다(이미 있으면 덮어쓴다). 기존 산출물 보호는 호출자가
@@ -3172,14 +3324,8 @@ def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path]
     start = time.time()
     input_path = input_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
-    if assets_dir is None:
-        assets_dir = output_path.with_suffix(".assets")
-    else:
-        assets_dir = assets_dir.expanduser().resolve()
-    if report_path is None:
-        report_path = output_path.with_suffix(".report.json")
-    else:
-        report_path = report_path.expanduser().resolve()
+    assets_dir = output_path.with_suffix(".assets") if assets_dir is None else assets_dir.expanduser().resolve()
+    report_path = output_path.with_suffix(".report.json") if report_path is None else report_path.expanduser().resolve()
 
     try:
         ensure_parent(output_path)
@@ -3224,13 +3370,15 @@ def convert_file(input_path: Path, output_path: Path, assets_dir: Optional[Path]
 
 
 def expand_batch(pattern: str) -> list[Path]:
-    # Windows에서도 따옴표로 전달된 glob을 자체 확장한다.
-    p = Path(pattern)
-    if any(ch in pattern for ch in "*?["):
-        base = p.parent if str(p.parent) not in {"", "."} else Path.cwd()
-        matched = sorted(base.glob(p.name))
-        return [x for x in matched if x.is_file()]
-    return [p]
+    """--batch 패턴을 파일 목록으로 푼다.
+
+    "*/*.hwp", "**/*.hwp"처럼 하위 폴더를 가리키는 패턴도 풀리도록 glob(recursive=True)를 쓴다.
+    Windows에서도 따옴표로 전달된 glob을 자체 확장한다.
+    """
+    if not any(ch in pattern for ch in "*?["):
+        return [Path(pattern)]
+    matched = sorted(glob.glob(pattern, recursive=True))
+    return [path for path in (Path(item) for item in matched) if path.is_file()]
 
 
 def unique_path(path: Path) -> Path:
@@ -3265,13 +3413,35 @@ def write_batch_summary(path: Path, documents: list[dict[str, Any]], ok: int, fa
     write_text_file(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def warn_about_noop_options(args: argparse.Namespace) -> None:
+    """아직 다르게 동작하지 않는 옵션을 썼을 때만 안내한다(P2-13)."""
+    if args.image_mode == "embed":
+        print("NOTE --image-mode embed는 아직 따로 구현되지 않아 extract와 동일하게 동작합니다.", file=sys.stderr)
+    if args.equation_mode in {"image", "both"}:
+        print(
+            f"NOTE --equation-mode {args.equation_mode}는 아직 이미지 수식을 만들지 않아 latex와 동일하게 동작합니다.",
+            file=sys.stderr,
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = Hwp2MdArgumentParser(
-        description="HWP/HWPX 문서를 Markdown과 assets/report 파일로 변환합니다.",
-        epilog=(
-            "종료 코드: 0 성공, 1 사용 오류(인자·대상 없음, 배치 일부 실패), "
-            "2 변환 실패(손상·암호화·읽기/쓰기 오류), 130 사용자 중단"
+        description=(
+            "HWP/HWPX 문서를 Markdown과 assets/report 파일로 변환합니다.\n"
+            "\n"
+            "배포용 문서(복사·인쇄 제한)의 본문도 변환하지만, 이 기능은 적법하게 열람·변환할\n"
+            "권한이 있는 문서에만 사용하세요. 권한 없는 문서의 제한 우회나 작성자가 허용하지\n"
+            "않은 재배포에는 쓸 수 없고, 사용에 따른 책임은 사용자에게 있습니다. 자세한 내용은\n"
+            "README의 「배포용 문서(복사·인쇄 제한) 변환 안내」를 보세요."
         ),
+        epilog=(
+            "종료 코드: 0 성공, 1 사용 오류(인자·대상 없음, 배치 일부 실패),\n"
+            "          2 변환 실패(손상·암호화·읽기/쓰기 오류), 130 사용자 중단\n"
+            "라이선스: MIT — Copyright (c) 2026 tearess (LICENSE 파일 참고)\n"
+            "한글과컴퓨터와 제휴·후원·승인 관계가 없는 독립 도구입니다."
+        ),
+        # 안내 문구의 줄바꿈을 도움말에서 그대로 보여 준다.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("input", nargs="?", help="입력 .hwp, .hwpx 또는 .hml(HWPML) 파일")
     parser.add_argument("-o", "--output", help="출력 Markdown 경로")
@@ -3282,6 +3452,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--image-mode", choices=["extract", "embed", "skip"], default="extract", help="이미지 처리 방식. embed는 현재 extract와 동일하게 동작")
     parser.add_argument("--equation-mode", choices=["latex", "image", "both", "skip"], default="latex", help="수식 처리 방식. image와 both는 현재 latex와 동일하게 동작")
     parser.add_argument("--frontmatter", choices=["none", "yaml"], default="yaml", help="YAML frontmatter 출력 여부")
+    parser.add_argument("--source-path", choices=["abs", "rel", "none"], default="rel", help="frontmatter의 source에 적을 원본 경로. rel(기본): 출력 폴더 기준 상대 경로, abs: 절대 경로, none: source 줄 생략")
     parser.add_argument("--include-page-artifacts", action="store_true", help="머리말/꼬리말 등 페이지 부속 정보를 가능한 경우 포함")
     parser.add_argument("--no-clean-assets", action="store_true", help="재변환 시 기존 generated assets 정리를 건너뜁니다.")
     parser.add_argument("--report", help="변환 리포트 JSON 경로. --batch와 함께 주면 문서별 리포트는 각 문서 옆에 남기고 이 경로에는 배치 전체 요약을 씁니다.")
@@ -3299,14 +3470,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         image_mode=args.image_mode,
         equation_mode=args.equation_mode,
         frontmatter=args.frontmatter,
+        source_path=args.source_path,
         include_page_artifacts=args.include_page_artifacts,
         clean_assets=not args.no_clean_assets,
         strict=args.strict,
         dump_ir=args.dump_ir,
     )
+    warn_about_noop_options(args)
 
     try:
         if args.batch:
+            if args.output and Path(args.output).suffix.lower() == ".md":
+                raise UsageError(
+                    "--batch에서 -o는 출력 폴더입니다. 파일 경로(out.md) 대신 폴더(예: -o converted)를 넘기세요."
+                )
             inputs = expand_batch(args.batch)
             if not inputs:
                 raise UsageError(f"batch 패턴에 매칭되는 파일이 없습니다: {args.batch}")
@@ -3343,7 +3520,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                             "elapsedSeconds": result.report.get("elapsedSeconds"),
                         }
                     )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
+                    # 한 문서의 예상 밖 오류가 배치 전체를 멈추지 않게 막고, 문서별로 기록한다.
                     print(f"FAIL {input_path}: {exc}", file=sys.stderr)
                     failed += 1
                     record.update({"ok": False, "error": str(exc)})

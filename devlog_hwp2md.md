@@ -10,8 +10,9 @@ HWP/HWPX 문서를 Markdown 초안으로 바꾸는 오프라인 변환기 `hwp2m
 | 최신 릴리스 | [v0.2.0](https://github.com/tearess/hwp2md/releases/tag/v0.2.0) (10/23) |
 | 입력 형식 | HWP 5.x(배포용 문서 포함), HWPX, HWPML(`.hml`, 확장자만 `.hwp`인 XML) |
 | 사용 형태 | CLI, tkinter GUI, Windows 실행 파일, 로컬 웹앱, Vercel 배포 구성 |
-| 마지막 코드 커밋 | `526ec5e` (`hwp2md.py` 2,854줄) |
-| 단위 테스트 | 122개 통과 (`python -m pytest tests`, 10/31 재실행) |
+| 라이선스 | MIT (`LICENSE`, Copyright (c) 2026 tearess) |
+| 마지막 코드 커밋 | `chore/p2-polish-packaging-and-docs` (PR #3, `hwp2md.py` 3,4xx줄) |
+| 단위 테스트 | 203개 통과 (`python -m unittest`, 7개 건너뜀 — tkinter 없는 환경 6개, 표본 `.hwp` 필요 1개) |
 | 시험한 문서 | 로컬 5,646개, 공개 샘플 6,332개, NAS 466개 ([4절](#4-시험-결과-누적)) |
 | 먼저 고칠 문제 | v0.2.0 릴리스의 실행 파일은 버전을 `0.1.0`으로 표시합니다. 소스는 고쳤고 다음 빌드부터 반영됩니다 ([7절](#7-남은-문제)) |
 
@@ -216,6 +217,39 @@ HWP/HWPX 문서를 Markdown 초안으로 바꾸는 오프라인 변환기 `hwp2m
 - **실측(감사 표본 44건, 원본 미수정)**: 성공 43건(암호 걸린 HWPX 1건은 종전과 같이 실패). 그림 99개 가운데 본문 배치가 **4 → 36개**로 늘고 위치 미확정이 **95 → 8개**로 줄었습니다(작은 로고·서명 57개는 본문 배치 대상이 아니라 첨부 목록으로 보존, `ASSET_EXCLUDED_FROM_BODY`로 따로 보고). 제목 442 → 349개, 번호 목록 435 → 499개, `UNHANDLED_HWP_CONTROLS` 24건 → 4건. 본문 글자는 0.3% 줄었고 그 감소분은 HWPX 그림 설명문 제거분입니다.
 - **시험**: 형식·제목·그림 위치·경고·입출력 오류·배치 리포트 시험 31개를 `tests/test_p1_quality.py`에 더했습니다(132 → 163개).
 
+### 11/28 (3단계) — P2 정리·패키징·품질 마무리
+
+감사의 P2 15건과 남은 P1-9(실제 HWP 바이너리 회귀), PR #1 잔여를 한 번에 정리했습니다. PR #2를 `main`에 머지한 뒤 새 브랜치에서 작업했습니다.
+
+- **실제 HWP 경로 회귀 시험**(P1-9): 저장소에 `.hwp` 표본을 넣지 않고도 OLE/HWP 경로를 타도록 `tests/fixtures.py`가 최소 CFB(Compound File Binary)를 직접 조립합니다. `FileHeader`(서명·압축 플래그), `BodyText/Section0`(문단·표·그림 컨트롤 레코드), `BinData/BIN0001`(PNG)을 담고, 스트림은 모두 4096바이트 이상으로 채워 OLE mini stream을 쓰지 않습니다. 이 픽스처로 `parse_hwp_records`, 압축/비압축 섹션, 표 복원, 그림 추출·본문 배치, 잘린 스트림 경고, 크기 한도 사전 차단을 검증합니다(`tests/test_hwp_binary.py`).
+- **frontmatter 원본 경로**(P2-1): `source`에 절대경로가 박히던 것을 `--source-path {abs,rel,none}`으로 고를 수 있게 했습니다. 기본 `rel`은 출력 폴더 기준 상대 경로이고, 폴더 밖으로 나가면 파일명만 적습니다. 결과물을 공유해도 로컬 폴더 구조가 드러나지 않습니다.
+- **HTML 표 유령 행**(P2-2): `rowspan>1`인 빈 셀로 만들던 `<tr><td rowspan="2"></td></tr>` 같은 빈 행을 걸러냅니다.
+- **표 평탄화 기록**(P2-3): 2차원 구조를 유지하지 못해 문단으로 푼 표를 `TABLE_FLATTENED` 경고와 `TABLE_STRUCTURE_FLATTENED` 손실로 집계합니다. HWP에서 본문을 상자에 넣는 관행인 1×1 서식 상자는 제외합니다.
+- **잘린 스트림**(P2-4): `parse_hwp_records`가 스트림이 잘린 지점과 남은 바이트를 `problems`로 돌려주고, 변환이 `SECTION_TRUNCATED`로 남깁니다. `<I`(unsigned)라 성립할 수 없던 `rec_size < 0` 죽은 조건도 지웠습니다.
+- **Windows 드라이브 경로**(P2-5): `os.path.relpath`가 다른 드라이브에서 `ValueError`를 내면 자산 링크는 절대 경로로, frontmatter는 파일명으로 대체합니다.
+- **배치 하위 폴더**(P2-6): `expand_batch`를 `glob(..., recursive=True)`로 바꿔 `*/*.hwp`, `**/*.hwp` 패턴이 풀립니다.
+- **배치 `-o` 실수**(P2-7): `--batch`에 `-o out.md`를 주면 `out.md/` 폴더를 만드는 대신 사용 오류(종료 코드 1)로 멈춥니다.
+- **메모리 상한 사전 확인**(P2-8): HWP 섹션·BinData 스트림은 읽기 전에 크기를 물어 한도를 넘으면 `SECTION_SKIPPED`/`ASSET_SKIPPED`로 건너뜁니다(압축하지 않은 스트림이 통째로 메모리에 올라가던 경로).
+- **웹앱 방어**(P2-9, PR #1 잔여): 소켓 타임아웃(기본 60초), 동시 변환 상한(기본 4건, 넘으면 503), 500 응답에서 내부 예외 문자열 제거(서버 로그에만 기록), zip 생성 시 확장자를 다시 검사해 실행·스크립트 확장자는 담지 않고 `summary.json`의 `excludedFiles`에 기록.
+- **`.hwp` 확장자의 암호 HWPX**(P2-10): "확장자가 .hwp지만 내용은 암호가 걸린 HWPX(ZIP) 문서"라고 원인을 구분해 안내합니다.
+- **코드 위생**(P2-11, P2-15): 죽은 함수(`next_metadata_value`)·미사용 import를 지우고, 들여쓰기가 어긋나 있던 `parse_hwp_table_records` 호출을 고쳤습니다. GUI `add_paths` 타입을 `Iterable[str | Path]`로 바로잡고, 넓은 `except Exception`은 예외 영역을 아는 곳에서 좁히고(파일 열기 `OSError`/`SubprocessError`, 결과 폴더 생성 `OSError`, XML 파싱 `ET.ParseError`) 한 파일 실패를 격리해야 하는 곳(배치·GUI 워커·웹앱 500)만 이유를 적고 남겼습니다. `pyproject.toml`에 ruff 설정(`E4/E7/E9/F/I/UP/BLE/S/SIM`)을 넣고 `ruff check .` **0건**을 유지합니다.
+- **패키징**(P2-12): `pyproject.toml`(setuptools)로 `pip install .`, `hwp2md` 콘솔 스크립트, `python -m hwp2md`를 지원합니다. 버전은 `hwp2md.VERSION` 한 곳에서 오고 `__version__`이 같은 값을 가리킵니다.
+- **무동작 옵션 안내**(P2-13): `--image-mode embed`, `--equation-mode image|both`는 결과가 같으므로 실행 시 한 줄 안내를 출력합니다.
+- **문서 정합화**(P2-14): README의 옵션 표·테스트 안내·샘플 문구를 실제 동작에 맞추고, `hwp2md_dev_plan.md`는 v0.1.0 역사 문서로 표시했습니다. 웹앱 `server_version`도 `hwp2md.VERSION`을 따릅니다.
+- **CI**: `.github/workflows/ci.yml`을 더해 Python 3.10~3.12에서 `unittest`와 `ruff check`를 돌리고, 빌드한 wheel로 `hwp2md`/`python -m hwp2md`까지 확인합니다. 연결된 GitHub App에 `workflows` 권한이 없어 이 파일은 저장소에 직접 push할 수 없었습니다. 전문은 `downloads/hwp2md_ci_workflow_2026-11-27/ci.yml`에 저장했고 PR 본문에도 실었으니, 저장소에 넣을 때는 워크플로 편집 권한이 있는 계정으로 파일을 추가하면 됩니다.
+- **시험**: 합성 HWP·압축 스트림·잘린 스트림·크기 한도·배치 패턴·웹앱 오류 응답 시험 34개를 더해 163 → 197개가 되었습니다.
+
+### 11/28 (3단계 마무리) — MIT 라이선스와 배포용 문서 이용 안내
+
+PR #3에 남겨 둔 사용자 결정 두 건(P1-10, P1-11)을 반영했습니다. 복호화 동작과 CLI 플래그 구조는 바꾸지 않고 표기와 안내만 정리했습니다.
+
+- **라이선스 MIT 확정**(P1-10): 루트 `LICENSE`에 MIT 전문과 `Copyright (c) 2026 tearess (https://github.com/tearess)`를 넣었습니다. `pdf2md`의 `NOTICE`와 같은 저작자 표기입니다.
+- **패키지 메타데이터**: `pyproject.toml`에 `license = "MIT"`, `license-files = ["LICENSE"]`(PEP 639)를 넣고 빌드 요구를 `setuptools>=77`로 올렸습니다. 만든 wheel의 `METADATA`에 `License-Expression: MIT`, `License-File: LICENSE`가 들어가고 `dist-info/licenses/LICENSE`가 동봉되는 것을 확인했습니다. `License ::` 분류기는 SPDX 식과 겹치므로 넣지 않았습니다.
+- **README**: 「라이선스 및 고지」를 MIT 기준으로 다시 썼습니다(재배포 시 고지 유지, 의존성 `olefile`(BSD), 한컴 비제휴, 결과 검수). 「배포용 문서(복사·인쇄 제한) 변환 안내」 절을 새로 두어 적법한 열람·변환 권한이 있는 문서에만 쓸 것, 권한 없는 제한 우회·재배포에 쓸 수 없다는 것, 실행과 결과 사용의 책임은 사용자에게 있다는 것, 암호 문서는 풀지 않는다는 것, `DISTRIBUTION_DOC_DECRYPTED` 리포트를 남기는 것을 적었습니다.
+- **CLI `--help`**: description에 같은 이용 범위 안내를, epilog에 라이선스(MIT)와 비제휴 고지를 넣고 `RawDescriptionHelpFormatter`로 줄바꿈을 유지했습니다. `--allow-distribution-doc` 같은 런타임 플래그는 만들지 않았습니다(현행 기능 유지).
+- **시험**: `tests/test_packaging_notices.py` 6개를 더해 197 → 203개. `LICENSE`·`pyproject.toml`·README 표기 일치와 `--help` 문구를 고정합니다.
+- **검증**: `python -m unittest discover -s tests` **203개 통과(0 errors / 0 failures, skip 7)**, `ruff check .` **0건**, `pip wheel` → `hwp2md-0.2.0-py3-none-any.whl` 생성 후 venv 설치에서 `hwp2md --version`(`hwp2md 0.2.0`)과 `--help` 문구를 확인했습니다.
+
 ## 4. 시험 결과 누적
 
 ### 로컬 문서
@@ -255,7 +289,7 @@ PC에서 찾은 파일은 중복 제외 8,026개입니다. 당시 지원 형식 
 
 ### 단위 테스트 수 변화
 
-23 → 26 → 31 → 38 → 40 → 46 → 47 → 53 → 60 → 62 → 65 → 70 → 71 → 74 → 76 → 80 → 86 → 94 → 100 → 103 → 106 → 115 → 122 → 132 → 163
+23 → 26 → 31 → 38 → 40 → 46 → 47 → 53 → 60 → 62 → 65 → 70 → 71 → 74 → 76 → 80 → 86 → 94 → 100 → 103 → 106 → 115 → 122 → 132 → 163 → 197 → 203
 
 ## 5. 알게 된 기술 사항
 
@@ -289,7 +323,7 @@ PC에서 찾은 파일은 중복 제외 8,026개입니다. 당시 지원 형식 
 
 | 항목 | 내용 |
 |---|---|
-| 버전 표기 | v0.2.0 소스(`526ec5e`)의 `VERSION`이 `0.1.0`이어서 릴리스된 실행 파일의 Markdown `converted_by`와 리포트 `converter`가 `0.1.0`으로 나옵니다. 소스는 `0.2.0`으로 고쳤지만 실행 파일은 다시 빌드해 배포해야 바뀝니다. |
+| 버전 표기 | v0.2.0 소스(`526ec5e`)의 `VERSION`이 `0.1.0`이어서 릴리스된 실행 파일의 Markdown `converted_by`와 리포트 `converter`가 `0.1.0`으로 나옵니다. 소스는 `0.2.0`으로 고쳤지만 실행 파일은 다시 빌드해 배포해야 바뀝니다. (3단계에서 `pyproject.toml`이 같은 값을 읽도록 정리했습니다. 실행 파일 재빌드는 여전히 필요합니다.) |
 | 대괄호 | 본문의 `[`를 이스케이프하지 않아 `[25명](이하…)` 같은 원문이 링크로 렌더링될 수 있습니다. |
 | 인라인 수식 표기 | 문장 안 수식을 `\( \)`로 내보내는데 GitHub·Obsidian은 `$ $`만 렌더링합니다. |
 | 빈 수식 | 내용이 없는 수식은 `\text{HWP equation}`으로 나옵니다. |
